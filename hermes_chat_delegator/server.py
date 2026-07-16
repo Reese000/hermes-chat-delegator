@@ -343,11 +343,19 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
                 r = await c.get(f"http://{host}:{port}/health")
                 if r.status_code == 200:
                     body = r.json()
-                    # Positive identification: look for Hermes-specific markers
+                    # Positive identification: look for Hermes-specific markers.
                     if any(k in body for k in ("version", "service", "hermes")):
                         return port
-                    # Also accept if it has a sessions-like shape
-                    if "error" not in body:
+                # A headless Hermes backend's /health legitimately returns
+                # {"error": "Headless backend ..."} — indistinguishable from
+                # an unrelated service on /health alone. Confirm identity via
+                # a Hermes-specific endpoint instead of guessing from the
+                # shape of /health (matching "no error key" previously
+                # accepted any unrelated service's bare {"status": "ok"}).
+                r2 = await c.get(f"http://{host}:{port}/api/sessions")
+                if r2.status_code == 200:
+                    body2 = r2.json()
+                    if isinstance(body2, dict) and "sessions" in body2:
                         return port
         except Exception:
             pass

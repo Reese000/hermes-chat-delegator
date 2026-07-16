@@ -20,6 +20,7 @@ from hermes_chat_delegator.server import (
     _summarize_event,
     _err,
     _text,
+    auto_discover_backend,
 )
 
 
@@ -592,3 +593,90 @@ class TestBranchSession:
             mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
             with pytest.raises(RuntimeError, match="empty"):
                 await backend.branch_session("empty_sess")
+
+
+# ---------------------------------------------------------------------------
+# auto_discover_backend
+# ---------------------------------------------------------------------------
+
+class PortRoutingTransport(httpx.AsyncBaseTransport):
+    """Routes requests to per-port canned responses, keyed by request port."""
+
+    def __init__(self, by_port: dict[int, dict[str, tuple[int, dict]]]):
+        self.by_port = by_port
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        routes = self.by_port.get(request.url.port, {})
+        for pattern, (status, body) in routes.items():
+            if pattern in request.url.path:
+                return httpx.Response(status, json=body)
+        return httpx.Response(404, json={"error": "not found"})
+
+
+_RealAsyncClient = httpx.AsyncClient
+
+
+def _patched_async_client(transport):
+    """Returns a real httpx.AsyncClient wired to `transport`, dropping the
+    caller's `transport` kwarg (if any) so ours always wins. Must close over
+    the pre-patch class — calling `httpx.AsyncClient` here would recurse into
+    whatever mock currently sits at that name."""
+    def _make(**kw):
+        kw.pop("transport", None)
+        return _RealAsyncClient(transport=transport, **kw)
+    return _make
+
+
+@pytest.mark.asyncio
+class TestAutoDiscoverBackend:
+    async def test_picks_real_backend_not_impostor_on_lower_port(self):
+        """Regression test for the H2 discovery bug: a headless Hermes
+        backend's /health legitimately returns a bare {"error": ...} body
+        (no distinguishing markers), which must not lose to an unrelated
+        local service whose /health merely lacks an "error" key — even when
+        that impostor sits on a numerically lower port and is probed first.
+        """
+        transport = PortRoutingTransport({
+            8001: {"/health": (200, {"status": "ok"})},  # impostor, lower port
+            9999: {
+                "/health": (200, {"error": "Headless backend (hermes serve): web UI disabled"}),
+                "/api/sessions": (200, {"sessions": []}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8001    0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:9999    0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient", side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 9999
+
+    async def test_returns_none_when_no_port_matches(self):
+        transport = PortRoutingTransport({})
+        netstat_output = "  TCP    127.0.0.1:8001    0.0.0.0:0    LISTENING    111\n"
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient", side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port is None
+
+    async def test_positive_version_marker_still_accepted(self):
+        """Non-headless backends that expose version/service markers on
+        /health should still be identified without needing /api/sessions."""
+        transport = PortRoutingTransport({
+            7000: {"/health": (200, {"version": "1.2.3", "service": "hermes"})},
+        })
+        netstat_output = "  TCP    127.0.0.1:7000    0.0.0.0:0    LISTENING    333\n"
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient", side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 7000
