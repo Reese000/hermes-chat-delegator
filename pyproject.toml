@@ -1,0 +1,19 @@
+[project]
+name = "hermes-chat-delegator"
+version = "0.2.0"
+description = "MCP server for delegating Hermes GUI chats — manage multiple concurrent chat sessions programmatically"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+hermes-chat-delegator = "hermes_chat_delegator.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
