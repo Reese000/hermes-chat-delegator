@@ -325,6 +325,51 @@ class TestSendPromptStaleResponse:
         )
 
 
+@pytest.mark.asyncio
+class TestSendPromptFreshDraftSession:
+    async def test_404_on_baseline_fetch_is_not_fatal(self):
+        """Regression test: reproduced live via create_chat(initial_message=...)
+        against a real backend. A brand-new draft session (from
+        create_session, no prompt sent yet) has no durable row, so GET
+        .../messages 404s. send_prompt's baseline fetch must treat that as
+        "no prior messages" instead of propagating the HTTPStatusError."""
+
+        new_msgs = [
+            {"id": "u1", "role": "user", "content": "hi"},
+            {"id": "a1", "role": "assistant", "content": "PONG"},
+        ]
+        call_count = {"messages": 0}
+
+        class FreshSessionTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url)
+                if "/health" in path:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/messages" in path:
+                    call_count["messages"] += 1
+                    if call_count["messages"] == 1:
+                        # Baseline fetch, before the first prompt ever lands.
+                        return httpx.Response(404, json={"error": "session not found"})
+                    return httpx.Response(200, json={"messages": new_msgs})
+                if "/api/sessions" in path:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=FreshSessionTransport(), timeout=5)
+
+        ws_frames = [
+            {"id": 1, "result": {"session_id": "live_new"}},
+            {"id": 2, "result": {"status": "streaming"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            result = await backend.send_prompt("brand_new_sess", "hi", timeout=10)
+
+        assert result["response"] == "PONG"
+
+
 # ---------------------------------------------------------------------------
 # create_session: draft path + initial_message path
 # ---------------------------------------------------------------------------
@@ -366,31 +411,27 @@ class TestCreateSession:
         assert sent["method"] == "session.create"
         assert sent["params"]["title"] == "My Draft"
 
-    async def test_initial_message_calls_send_prompt(self):
-        """create_session + initial_message should call send_prompt after
-        creation, and the C2 fix should apply — it must NOT return a stale
-        assistant message."""
+    async def test_initial_message_submits_on_same_connection(self):
+        """Regression test: reproduced live against the real backend.
+        create_session(initial_message=...) must submit the prompt on the
+        SAME websocket connection using the live id session.create already
+        returned — not via a separate send_prompt(durable_id, ...) call
+        afterward. A brand-new session has no durable row yet (Hermes
+        persists it on first prompt), so session.resume-by-durable-id 404s
+        (backend error 4007 'session not found') until after that first
+        submit lands."""
 
-        old_msgs = [
-            {"id": "o1", "role": "user", "content": "Q"},
-            {"id": "o2", "role": "assistant", "content": "OLD"},
-        ]
-        new_msgs = old_msgs + [
+        new_msgs = [
             {"id": "n1", "role": "user", "content": "hi"},
             {"id": "n2", "role": "assistant", "content": "HELLO"},
         ]
-        call = {"n": 0}
 
         class InitTransport(httpx.AsyncBaseTransport):
             async def handle_async_request(self, req):
-                call["n"] += 1
                 p = req.url.raw_path
                 if isinstance(p, bytes): p = p.decode()
                 if "/messages" in p:
-                    if call["n"] <= 1:
-                        return httpx.Response(200, json={"messages": old_msgs})
-                    else:
-                        return httpx.Response(200, json={"messages": new_msgs})
+                    return httpx.Response(200, json={"messages": new_msgs})
                 if "/health" in p:
                     return httpx.Response(200, json={"status": "ok"})
                 if "/sessions" in p:
@@ -400,39 +441,35 @@ class TestCreateSession:
         backend = GuiBackend("127.0.0.1", 9999)
         backend._client = httpx.AsyncClient(transport=InitTransport(), timeout=5)
 
-        # WS: session.create → prompt.submit
-        create_frames = [
+        ws_frames = [
             {"id": 1, "result": {
                 "session_id": "live_new",
                 "stored_session_id": "new_sess",
                 "info": {},
             }},
         ]
-        prompt_frames = [
-            {"id": 1, "result": {"session_id": "live_new"}},
-            {"id": 2, "result": {"status": "streaming"}},
-        ]
 
-        call_count = {"ws": 0}
+        captured_ws = []
         def fake_ws(url):
-            call_count["ws"] += 1
-            if call_count["ws"] == 1:
-                return FakeWebSocketSendPrompt(create_frames)
-            return FakeWebSocketSendPrompt(prompt_frames)
+            ws = FakeWebSocketSendPrompt(ws_frames)
+            captured_ws.append(ws)
+            return ws
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
             mock_ws.connect = fake_ws
-            result = await backend.create_session(title="Init", model="test")
-            # Now send the initial_message (simulating what h_create_chat does)
-            prompt_result = await backend.send_prompt(
-                result["session_id"], "hi", timeout=10
+            result = await backend.create_session(
+                title="Init", model="test", initial_message="hi",
             )
 
         assert result["session_id"] == "new_sess"
-        # C2 regression check: must get NEW answer, not stale
-        assert prompt_result["response"] == "HELLO", (
-            f"Got stale: {prompt_result['response']!r}"
-        )
+        assert result["initial_response"] == "HELLO"
+        # Exactly one WS connection opened — create and submit share it.
+        assert len(captured_ws) == 1
+        sent = [json.loads(s) for s in captured_ws[0]._sent]
+        assert sent[0]["method"] == "session.create"
+        assert sent[1]["method"] == "prompt.submit"
+        # Submitted against the live id, never a resume-by-durable-id call.
+        assert sent[1]["params"]["session_id"] == "live_new"
 
     async def test_create_session_ws_error(self):
         """session.create returning an error should raise RuntimeError."""
@@ -445,6 +482,32 @@ class TestCreateSession:
             mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
             with pytest.raises(RuntimeError, match="session.create failed"):
                 await backend.create_session()
+
+    async def test_ignores_stray_broadcast_event_before_response(self):
+        """Regression test: reproduced live against the real backend. The
+        shared WS connection also carries unsolicited `event` broadcasts for
+        other live sessions (e.g. another GUI tab). If one of those arrives
+        before our numbered session.create reply, the old code treated it as
+        the response and crashed with KeyError('result'). It must be skipped
+        instead."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        ws_frames = [
+            {"jsonrpc": "2.0", "method": "event",
+             "params": {"session_id": "some_other_live_session", "type": "message.delta"}},
+            {"id": 1, "result": {
+                "session_id": "live_new",
+                "stored_session_id": "new_sess",
+                "info": {},
+            }},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            result = await backend.create_session(title="Real Work")
+
+        assert result["session_id"] == "new_sess"
 
 
 # ---------------------------------------------------------------------------

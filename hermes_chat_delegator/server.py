@@ -33,6 +33,24 @@ from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
 
+
+async def _recv_response(ws, expected_id: int, timeout: float) -> dict:
+    """Read WS frames until the JSON-RPC reply with id == expected_id.
+
+    The same socket also carries unsolicited `event` broadcasts for any live
+    session (e.g. another GUI tab's traffic), which don't carry our request
+    id. A bare `ws.recv()` can return one of those instead of our reply,
+    causing a KeyError on "result" downstream — skip anything that isn't
+    our numbered response instead of assuming the first frame is it.
+    """
+    async def _loop():
+        while True:
+            resp = json.loads(await ws.recv())
+            if resp.get("id") == expected_id:
+                return resp
+    return await asyncio.wait_for(_loop(), timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # Backend connection
 # ---------------------------------------------------------------------------
@@ -114,9 +132,49 @@ class GuiBackend:
         r.raise_for_status()
         return r.json()
 
+    async def _poll_for_reply(self, durable_session_id: str, last_assistant_id,
+                              timeout: float) -> dict:
+        """Poll the REST messages endpoint (durable id only — the live id
+        404s, see send_prompt) until a NEW assistant message appears."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                msgs = await self.get_messages(durable_session_id, last_n=5)
+                for m in reversed(msgs):
+                    if m.get("role") == "assistant":
+                        if last_assistant_id is None or m.get("id") != last_assistant_id:
+                            return {
+                                "response": m.get("content", ""),
+                                "session_id": durable_session_id,
+                                "message_count": len(msgs),
+                            }
+                        break  # Still the old one, keep waiting
+            except Exception:
+                pass
+
+        # Timeout — return whatever we have
+        msgs = await self.get_messages(durable_session_id, last_n=5)
+        last = next((m for m in reversed(msgs) if m.get("role") == "assistant"), None)
+        return {
+            "response": last.get("content", "") if last else "(timeout)",
+            "session_id": durable_session_id,
+            "message_count": len(msgs),
+            "timed_out": True,
+        }
+
     async def create_session(self, title: str = "", cwd: str = "", model: str = "",
-                             timeout: float = 15) -> dict:
-        """Create a new live session via session.create. Does NOT send a first prompt."""
+                             initial_message: str = "", timeout: float = 15,
+                             prompt_timeout: float = 300) -> dict:
+        """Create a new live session via session.create.
+
+        If initial_message is given, submits it on the SAME connection using
+        the live id session.create just returned. This must not be done as a
+        separate send_prompt(durable_id, ...) call afterward — a brand-new
+        session has no durable row yet (Hermes persists it on first prompt),
+        so session.resume-by-durable-id 404s (backend error 4007) until
+        after that first submit has happened.
+        """
         async with websockets.connect(self.ws_url) as ws:
             params: dict = {}
             if title:
@@ -128,16 +186,32 @@ class GuiBackend:
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.create", "params": params,
             }))
-            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            resp = await _recv_response(ws, 1, timeout)
             if "error" in resp:
                 raise RuntimeError(f"session.create failed: {resp['error']}")
             result = resp["result"]
-            return {
+            created = {
                 "session_id": result.get("stored_session_id", ""),
                 "live_session_id": result.get("session_id", ""),
                 "title": title or "untitled",
                 "cwd": result.get("info", {}).get("cwd", ""),
             }
+
+            if initial_message:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                    "params": {"session_id": created["live_session_id"], "text": initial_message},
+                }))
+
+        if initial_message:
+            reply = await self._poll_for_reply(
+                created["session_id"], last_assistant_id=None, timeout=prompt_timeout,
+            )
+            created["initial_response"] = reply["response"]
+            if reply.get("timed_out"):
+                created["initial_response_timed_out"] = True
+
+        return created
 
     async def branch_session(self, session_id: str, title: str = "",
                              timeout: float = 15) -> dict:
@@ -148,7 +222,7 @@ class GuiBackend:
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
                 "params": {"session_id": session_id},
             }))
-            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            resp = await _recv_response(ws, 1, timeout)
             if "error" in resp:
                 raise RuntimeError(f"resume failed: {resp['error']}")
             live_id = resp["result"].get("session_id", session_id)
@@ -160,7 +234,7 @@ class GuiBackend:
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 2, "method": "session.branch", "params": params,
             }))
-            resp2 = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            resp2 = await _recv_response(ws, 2, timeout)
             if "error" in resp2:
                 err = resp2["error"]
                 if err.get("code") == 4008:
@@ -188,8 +262,17 @@ class GuiBackend:
     async def send_prompt(self, session_id: str, message: str,
                           timeout: float = 300) -> dict:
         """Send a prompt via WebSocket. Returns when agent finishes or timeout."""
-        # Get the last assistant message id BEFORE submitting
-        before_msgs = await self.get_messages(session_id, last_n=5)
+        # Get the last assistant message id BEFORE submitting. A brand-new
+        # draft session (from create_session with no prior prompt) has no
+        # durable row yet, so the messages endpoint 404s — that just means
+        # there's no prior baseline, not a real error.
+        try:
+            before_msgs = await self.get_messages(session_id, last_n=5)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                before_msgs = []
+            else:
+                raise
         last_assistant_id = None
         for m in reversed(before_msgs):
             if m.get("role") == "assistant":
@@ -202,48 +285,20 @@ class GuiBackend:
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
                 "params": {"session_id": session_id},
             }))
-            while True:
-                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                if resp.get("id") == 1 and "result" in resp:
-                    internal_sid = resp["result"].get("session_id", session_id)
-                    break
-                if "error" in resp:
-                    raise RuntimeError("resume failed: " + str(resp.get("error", "unknown")))
+            resp = await _recv_response(ws, 1, timeout=15)
+            if "error" in resp:
+                raise RuntimeError("resume failed: " + str(resp.get("error", "unknown")))
+            live_id = resp["result"].get("session_id", session_id)
 
             # Submit
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
-                "params": {"session_id": internal_sid, "text": message},
+                "params": {"session_id": live_id, "text": message},
             }))
 
-        # Poll until a NEW assistant message appears (not the old one)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            await asyncio.sleep(2)
-            try:
-                msgs = await self.get_messages(internal_sid, last_n=5)
-                for m in reversed(msgs):
-                    if m.get("role") == "assistant":
-                        # Check if this is a NEW assistant message
-                        if last_assistant_id is None or m.get("id") != last_assistant_id:
-                            return {
-                                "response": m.get("content", ""),
-                                "session_id": session_id,
-                                "message_count": len(msgs),
-                            }
-                        break  # Still the old one, keep waiting
-            except Exception:
-                pass
-
-        # Timeout — return whatever we have
-        msgs = await self.get_messages(internal_sid, last_n=5)
-        last = next((m for m in reversed(msgs) if m.get("role") == "assistant"), None)
-        return {
-            "response": last.get("content", "") if last else "(timeout)",
-            "session_id": session_id,
-            "message_count": len(msgs),
-            "timed_out": True,
-        }
+        # Poll via REST (durable id only — the live id 404s here, confirmed
+        # live: 404 on live id, 200 on durable id for the same session).
+        return await self._poll_for_reply(session_id, last_assistant_id, timeout)
 
     async def send_prompt_stream(self, session_id: str, message: str,
                                  timeout: float = 300):
@@ -254,7 +309,7 @@ class GuiBackend:
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
                 "params": {"session_id": session_id},
             }))
-            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            resp = await _recv_response(ws, 1, timeout=15)
             if "error" in resp:
                 raise RuntimeError(f"resume failed: {resp['error']}")
             live_id = resp["result"].get("session_id", session_id)
@@ -694,6 +749,8 @@ async def h_create_chat(args: dict):
             title=args.get("title", ""),
             cwd=args.get("cwd", ""),
             model=args.get("model", ""),
+            initial_message=args.get("initial_message", ""),
+            prompt_timeout=args.get("timeout", 300),
         )
         # Warn if cwd was requested but didn't stick
         if args.get("cwd") and created.get("cwd") and created["cwd"] != args["cwd"]:
@@ -701,12 +758,7 @@ async def h_create_chat(args: dict):
                 f"Requested cwd={args['cwd']!r} but backend used {created['cwd']!r}. "
                 "The path may not exist."
             )
-        if msg := args.get("initial_message"):
-            result = await b.send_prompt(
-                created["session_id"], msg,
-                timeout=args.get("timeout", 300),
-            )
-            created["initial_response"] = result["response"]
+        if args.get("initial_message"):
             created["persisted"] = True
         else:
             created["persisted"] = False
