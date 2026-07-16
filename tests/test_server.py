@@ -218,15 +218,21 @@ class FakeWebSocketSendPrompt:
     NOT return the old one.
     """
 
-    def __init__(self, frames):
+    def __init__(self, frames, timeout_on_exhaust=True):
         self._frames = iter(frames)
-        self._sent = []
+        self._sent: list[str] = []
+        self._timeout_on_exhaust = timeout_on_exhaust
 
     async def send(self, data):
         self._sent.append(data)
 
     async def recv(self):
-        return json.dumps(next(self._frames))
+        try:
+            return json.dumps(next(self._frames))
+        except StopIteration:
+            if self._timeout_on_exhaust:
+                raise asyncio.TimeoutError()
+            raise
 
     async def __aenter__(self):
         return self
@@ -316,6 +322,250 @@ class TestSendPromptStaleResponse:
         assert result["response"] == "NEW ANSWER", (
             f"Got stale response: {result['response']!r} — C2 regression!"
         )
+
+
+# ---------------------------------------------------------------------------
+# create_session: draft path + initial_message path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCreateSession:
+    async def test_draft_returns_durable_id_no_prompt(self):
+        """Draft create_session calls session.create, returns durable id,
+        does NOT call prompt.submit."""
+        transport = MockTransport({"/health": (200, {"status": "ok"})})
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+
+        ws_frames = [
+            {"id": 1, "result": {
+                "session_id": "live_draft",
+                "stored_session_id": "20260716_120000_abc",
+                "info": {"cwd": "/some/path"},
+            }},
+        ]
+
+        captured_ws = []
+        def fake_ws(url):
+            ws = FakeWebSocketSendPrompt(ws_frames)
+            captured_ws.append(ws)
+            return ws
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = fake_ws
+            result = await backend.create_session(title="My Draft", cwd="/some/path")
+
+        assert result["session_id"] == "20260716_120000_abc"
+        assert result["live_session_id"] == "live_draft"
+        assert result["title"] == "My Draft"
+        assert result["cwd"] == "/some/path"
+        # Verify only session.create was sent (no prompt.submit)
+        assert len(captured_ws) == 1
+        sent = json.loads(captured_ws[0]._sent[0])
+        assert sent["method"] == "session.create"
+        assert sent["params"]["title"] == "My Draft"
+
+    async def test_initial_message_calls_send_prompt(self):
+        """create_session + initial_message should call send_prompt after
+        creation, and the C2 fix should apply — it must NOT return a stale
+        assistant message."""
+
+        old_msgs = [
+            {"id": "o1", "role": "user", "content": "Q"},
+            {"id": "o2", "role": "assistant", "content": "OLD"},
+        ]
+        new_msgs = old_msgs + [
+            {"id": "n1", "role": "user", "content": "hi"},
+            {"id": "n2", "role": "assistant", "content": "HELLO"},
+        ]
+        call = {"n": 0}
+
+        class InitTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, req):
+                call["n"] += 1
+                p = req.url.raw_path
+                if isinstance(p, bytes): p = p.decode()
+                if "/messages" in p:
+                    if call["n"] <= 1:
+                        return httpx.Response(200, json={"messages": old_msgs})
+                    else:
+                        return httpx.Response(200, json={"messages": new_msgs})
+                if "/health" in p:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/sessions" in p:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=InitTransport(), timeout=5)
+
+        # WS: session.create → prompt.submit
+        create_frames = [
+            {"id": 1, "result": {
+                "session_id": "live_new",
+                "stored_session_id": "new_sess",
+                "info": {},
+            }},
+        ]
+        prompt_frames = [
+            {"id": 1, "result": {"session_id": "live_new"}},
+            {"id": 2, "result": {"status": "streaming"}},
+        ]
+
+        call_count = {"ws": 0}
+        def fake_ws(url):
+            call_count["ws"] += 1
+            if call_count["ws"] == 1:
+                return FakeWebSocketSendPrompt(create_frames)
+            return FakeWebSocketSendPrompt(prompt_frames)
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = fake_ws
+            result = await backend.create_session(title="Init", model="test")
+            # Now send the initial_message (simulating what h_create_chat does)
+            prompt_result = await backend.send_prompt(
+                result["session_id"], "hi", timeout=10
+            )
+
+        assert result["session_id"] == "new_sess"
+        # C2 regression check: must get NEW answer, not stale
+        assert prompt_result["response"] == "HELLO", (
+            f"Got stale: {prompt_result['response']!r}"
+        )
+
+    async def test_create_session_ws_error(self):
+        """session.create returning an error should raise RuntimeError."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        ws_frames = [{"id": 1, "error": {"code": -1, "message": "nope"}}]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            with pytest.raises(RuntimeError, match="session.create failed"):
+                await backend.create_session()
+
+
+# ---------------------------------------------------------------------------
+# send_prompt_stream: async generator yields events in order
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSendPromptStream:
+    async def test_yields_events_in_order_with_full_transcript(self):
+        """Stream a realistic event sequence and verify order + final answer."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        # Build WS frames: resume response + event stream
+        ws_frames = [
+            # Resume response
+            {"id": 1, "result": {"session_id": "live_xyz"}},
+            # prompt.submit ack (ignored by stream loop — it's not method="event")
+            {"id": 2, "result": {"status": "streaming"}},
+            # Event stream
+            {"method": "event", "params": {"type": "message.start", "session_id": "live_xyz", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_xyz", "payload": {"delta": "Sure, "}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_xyz", "payload": {"delta": "I can "}}},
+            {"method": "event", "params": {"type": "tool.start", "session_id": "live_xyz", "payload": {"name": "terminal"}}},
+            {"method": "event", "params": {"type": "tool.complete", "session_id": "live_xyz", "payload": {"name": "terminal"}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_xyz", "payload": {"delta": "help."}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_xyz", "payload": {"content": "Sure, I can help."}}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            events = []
+            final = None
+            async for etype, payload in backend.send_prompt_stream("test", "help me", timeout=10):
+                if etype == "__done__":
+                    final = payload
+                    break
+                events.append((etype, payload.get("delta", "") or payload.get("name", "")))
+
+        # Verify event order
+        types = [e[0] for e in events]
+        assert types == [
+            "message.start",
+            "message.delta", "message.delta",
+            "tool.start", "tool.complete",
+            "message.delta",
+            "message.complete",
+        ], f"Event order wrong: {types}"
+
+        # Verify final answer assembled from deltas
+        assert final is not None
+        assert final["response"] == "Sure, I can help."
+        assert final["session_id"] == "test"
+
+    async def test_ignores_other_sessions_events(self):
+        """Events for a different session_id should be silently skipped."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        ws_frames = [
+            {"id": 1, "result": {"session_id": "live_ours"}},
+            {"id": 2, "result": {"status": "streaming"}},
+            # Another session's event (wrong session_id) — should be skipped
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_other", "payload": {"delta": "ignore me"}}},
+            # Our session's event
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_ours", "payload": {"delta": "YES"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_ours", "payload": {"content": "YES"}}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            events = []
+            final = None
+            async for etype, payload in backend.send_prompt_stream("s", "go", timeout=10):
+                if etype == "__done__":
+                    final = payload
+                    break
+                events.append(etype)
+
+        assert events == ["message.delta", "message.complete"]  # only ours
+        assert final["response"] == "YES"
+
+    async def test_error_event_raises(self):
+        """An 'error' event mid-turn should raise RuntimeError."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        ws_frames = [
+            {"id": 1, "result": {"session_id": "live_err"}},
+            {"id": 2, "result": {"status": "streaming"}},
+            {"method": "event", "params": {"type": "error", "session_id": "live_err", "payload": {"message": "boom"}}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            with pytest.raises(RuntimeError, match="agent error mid-turn"):
+                async for _ in backend.send_prompt_stream("s", "x", timeout=10):
+                    pass
+
+    async def test_timeout_returns_what_it_has(self):
+        """If WS yields no complete event, stream should time out with
+        partial text and timed_out=True."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        # Only resume + submit, then silence (no events at all)
+        ws_frames = [
+            {"id": 1, "result": {"session_id": "live_t"}},
+            {"id": 2, "result": {"status": "streaming"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            final = None
+            async for etype, payload in backend.send_prompt_stream("s", "x", timeout=2):
+                if etype == "__done__":
+                    final = payload
+                    break
+
+        assert final is not None
+        assert final["timed_out"] is True
+        assert final["response"] == ""
 
 
 # ---------------------------------------------------------------------------
