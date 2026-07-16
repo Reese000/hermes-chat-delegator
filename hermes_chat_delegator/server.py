@@ -439,6 +439,9 @@ TOOLS: list[Tool] = [
             "interactions where you just need the final answer. For turns that "
             "involve multiple tool calls and you want visibility into what the "
             "agent is doing, use send_prompt_stream instead."
+            " Note: if a human has this session's GUI tab open, using this tool "
+            "will freeze that tab's live view until they reopen/refocus it (known "
+            "backend limitation, not a bug in this server)."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Session to prompt into"},
@@ -457,7 +460,10 @@ TOOLS: list[Tool] = [
             "immediately and get a session that's fully visible right away; "
             "omit it to create an empty draft session (matches what the GUI "
             "does when you click 'New chat'). Note: a bad model name will "
-            "surface as an error on the first send_prompt, not on create_chat."
+            "surface as an error on the first send_prompt, not on create_chat. "
+            "Note: if initial_message is provided and a human has this session's "
+            "GUI tab open, using this tool will freeze that tab's live view until "
+            "they reopen/refocus it (known backend limitation, not a bug in this server)."
         ),
         inputSchema={"type": "object", "properties": {
             "title": {"type": "string", "description": "Optional title. Untitled if omitted."},
@@ -483,6 +489,9 @@ TOOLS: list[Tool] = [
             "message history. Equivalent to clicking 'Branch' in the GUI. The "
             "source session must already have at least one message — forking an "
             "empty/draft session fails with a clear error."
+            " Note: if a human has the source session's GUI tab open, using this "
+            "tool will freeze that tab's live view until they reopen/refocus it "
+            "(known backend limitation, not a bug in this server)."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Durable session ID to fork from."},
@@ -503,6 +512,9 @@ TOOLS: list[Tool] = [
             "actually did, not just its final answer. Use this instead of "
             "send_prompt when the turn might involve multiple tool calls and you "
             "want visibility into what the agent is doing while you wait."
+            " Note: if a human has this session's GUI tab open, using this tool "
+            "will freeze that tab's live view until they reopen/refocus it (known "
+            "backend limitation, not a bug in this server)."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Session to prompt into"},
