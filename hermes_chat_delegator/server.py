@@ -84,6 +84,20 @@ async def _recv_response(ws, expected_id: int, timeout: float) -> dict:
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 
+
+# Transport-level hiccups that a bare immediate retry reliably clears: a
+# one-off refused/reset connection right after the backend restarts (the
+# listening socket exists but the ASGI app isn't fully up yet), or a read
+# reset on a connection the OS half-closed. Deliberately narrow — this must
+# never swallow real application errors (4xx/5xx, timeouts long enough to
+# indicate a genuinely stuck backend get their own handling upstream).
+_TRANSIENT_HTTP_ERRORS = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+
 class GuiBackend:
     def __init__(self, host: str, port: int, token: str = ""):
         self.host = host
@@ -111,13 +125,45 @@ class GuiBackend:
     async def aclose(self):
         await self._client.aclose()
 
+    async def _request(self, method: str, url: str, *, retries: int = 2,
+                       retry_delay: float = 0.4, **kwargs) -> httpx.Response:
+        """Issue an HTTP request, retrying transient transport failures.
+
+        Observed in a 12h orchestration session: get_messages polls
+        occasionally hit a one-off "not_connected" (httpx.ConnectError) that
+        an immediate retry always cleared — the backend was up throughout,
+        it was a momentary accept-queue/socket blip, not a real outage
+        (defect #4). Retrying HERE, inside the backend client, means every
+        caller (list/get/messages/rename/delete, and the send_prompt polling
+        loop) gets the resilience automatically instead of each call site
+        needing its own retry loop. Does NOT retry HTTP error responses
+        (4xx/5xx) — those are real answers from a reachable server, not
+        transport failures — nor does it retry timeouts (a slow backend
+        should surface as slow, not silently multiply the wait).
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                return await self._client.request(method, url, **kwargs)
+            except _TRANSIENT_HTTP_ERRORS as e:
+                last_exc = e
+                if attempt < retries:
+                    logger.debug(
+                        "Transient %s on %s %s (attempt %d/%d) — retrying",
+                        type(e).__name__, method, url, attempt + 1, retries,
+                    )
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+        assert last_exc is not None
+        raise last_exc
+
     async def health(self) -> dict:
-        r = await self._client.get(f"{self.base_url}/health")
+        r = await self._request("GET", f"{self.base_url}/health")
         return r.json()
 
     async def list_sessions(self, limit: int = 50) -> list[dict]:
-        r = await self._client.get(
-            f"{self.base_url}/api/sessions",
+        r = await self._request(
+            "GET", f"{self.base_url}/api/sessions",
             params={"limit": limit, "min_messages": 0, "order": "recent"},
         )
         r.raise_for_status()
@@ -125,36 +171,50 @@ class GuiBackend:
 
     async def _list_all(self) -> list[dict]:
         """List all sessions (no limit)."""
-        r = await self._client.get(
-            f"{self.base_url}/api/sessions",
+        r = await self._request(
+            "GET", f"{self.base_url}/api/sessions",
             params={"limit": 500, "min_messages": 0, "order": "recent"},
         )
         r.raise_for_status()
         return r.json().get("sessions", [])
 
     async def get_session(self, session_id: str) -> dict:
-        r = await self._client.get(f"{self.base_url}/api/sessions/{session_id}")
+        r = await self._request("GET", f"{self.base_url}/api/sessions/{session_id}")
         r.raise_for_status()
         return r.json()
 
     async def get_messages(self, session_id: str, last_n: int = 20) -> list[dict]:
-        r = await self._client.get(f"{self.base_url}/api/sessions/{session_id}/messages")
+        r = await self._request("GET", f"{self.base_url}/api/sessions/{session_id}/messages")
         r.raise_for_status()
         messages = r.json().get("messages", [])
         if last_n > 0:
             messages = messages[-last_n:]
         return messages
 
+    async def list_interrupted_sessions(self) -> list[dict]:
+        """Sessions that look like a backend restart/crash killed them
+        mid-turn (see hermes' GET /api/sessions/interrupted). Empty list on
+        any failure — including talking to a pre-fix backend that doesn't
+        have this endpoint yet (404), which must never break callers that
+        merely want to know "any interrupted sessions?" as a side note.
+        """
+        try:
+            r = await self._request("GET", f"{self.base_url}/api/sessions/interrupted")
+            r.raise_for_status()
+            return r.json().get("sessions", [])
+        except Exception:
+            return []
+
     async def rename_session(self, session_id: str, title: str) -> dict:
-        r = await self._client.patch(
-            f"{self.base_url}/api/sessions/{session_id}",
+        r = await self._request(
+            "PATCH", f"{self.base_url}/api/sessions/{session_id}",
             json={"title": title},
         )
         r.raise_for_status()
         return r.json()
 
     async def delete_session(self, session_id: str) -> dict:
-        r = await self._client.delete(f"{self.base_url}/api/sessions/{session_id}")
+        r = await self._request("DELETE", f"{self.base_url}/api/sessions/{session_id}")
         r.raise_for_status()
         return r.json()
 
@@ -174,19 +234,59 @@ class GuiBackend:
                                 "response": m.get("content", ""),
                                 "session_id": durable_session_id,
                                 "message_count": len(msgs),
+                                "status": "completed",
                             }
                         break  # Still the old one, keep waiting
             except Exception:
                 pass
 
-        # Timeout — return whatever we have
-        msgs = await self.get_messages(durable_session_id, last_n=5)
-        last = next((m for m in reversed(msgs) if m.get("role") == "assistant"), None)
+        # Timed out. Do one last check in case the reply landed in the
+        # instant between the final poll and here — but NEVER fall back to
+        # echoing last_assistant_id's own (pre-submit) content as if it were
+        # the answer to THIS prompt. Doing that used to make a slow turn look
+        # like it silently answered with stale/wrong text instead of visibly
+        # timing out (defect #5) — a caller that doesn't check `timed_out`
+        # would be misled. `response` is only ever populated here when a
+        # genuinely NEW assistant message was found; otherwise it is
+        # explicitly None with status="pending" so the ambiguity is
+        # impossible to miss.
+        try:
+            msgs = await self.get_messages(durable_session_id, last_n=5)
+        except Exception:
+            msgs = []
+        new_reply = None
+        for m in reversed(msgs):
+            if m.get("role") == "assistant":
+                if last_assistant_id is None or m.get("id") != last_assistant_id:
+                    new_reply = m
+                break  # Only the most recent message counts either way
+
+        if new_reply is not None:
+            return {
+                "response": new_reply.get("content", ""),
+                "session_id": durable_session_id,
+                "message_count": len(msgs),
+                "timed_out": True,
+                "status": "completed_late",
+                "note": (
+                    "The reply arrived right at the timeout boundary — "
+                    "included here so it isn't lost, but the call did exceed "
+                    "the requested timeout."
+                ),
+            }
         return {
-            "response": last.get("content", "") if last else "(timeout)",
+            "response": None,
             "session_id": durable_session_id,
             "message_count": len(msgs),
             "timed_out": True,
+            "status": "pending",
+            "note": (
+                "No new assistant reply yet — the turn may still be running "
+                "on the backend. This is NOT a stale echo of a previous "
+                "reply: `response` is null on purpose. Poll get_messages() "
+                "on this session_id, or call send_prompt again with a "
+                "longer timeout, to pick up the eventual answer."
+            ),
         }
 
     async def create_session(self, title: str = "", cwd: str = "", model: str = "",
@@ -494,7 +594,11 @@ TOOLS: list[Tool] = [
         name="list_chats",
         description=(
             "List all chat sessions visible in the Hermes GUI, sorted by most "
-            "recent activity. Shows active status."
+            "recent activity. Shows active status. Sessions a backend "
+            "restart/crash interrupted mid-turn are flagged with "
+            "interrupted=true (see backend_status for the full list with "
+            "reasoning) — a resume-and-continue candidate, since those "
+            "sessions will not reply on their own."
         ),
         inputSchema={"type": "object", "properties": {
             "limit": {"type": "integer", "description": "Max sessions (default 50)"},
@@ -513,11 +617,31 @@ TOOLS: list[Tool] = [
         name="get_messages",
         description=(
             "Get message history from a GUI chat session. Returns the last N "
-            "messages by default (20). Pass last_n=0 for full history."
+            "messages by default (20). Pass last_n=0 for full history. A "
+            "session's full history can run 60K+ chars in one call — use "
+            "max_chars and/or compact to keep the response manageable."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Session ID"},
             "last_n": {"type": "integer", "description": "Only last N messages (default 20, 0=all)"},
+            "max_chars": {
+                "type": "integer",
+                "description": (
+                    "Truncate each message's content/reasoning text to this "
+                    "many characters (0=no limit, default 0). A truncated "
+                    "field gets a matching '<field>_truncated: true' marker "
+                    "and '<field>_original_chars' so truncation is never "
+                    "silent."
+                ),
+            },
+            "compact": {
+                "type": "boolean",
+                "description": (
+                    "Omit verbose fields (reasoning, raw tool-call/result "
+                    "payloads) that aren't needed for a quick skim of the "
+                    "conversation. Default false."
+                ),
+            },
         }, "required": ["session_id"]},
     ),
     Tool(
@@ -681,6 +805,14 @@ async def h_list_chats(args: dict):
     try:
         sessions = await b.list_sessions(limit=args.get("limit", 50))
         sessions.sort(key=lambda s: _safe_epoch(s.get("last_active")), reverse=True)
+        # Best-effort cross-reference against the backend's interrupted-session
+        # detector (defect #1: a restart/crash mid-turn leaves a session that
+        # will never reply on its own). Never raises — an older backend
+        # without this endpoint, or a transient failure, just means no
+        # sessions get flagged this call, not a broken list_chats.
+        interrupted_ids = {
+            s.get("id") for s in await b.list_interrupted_sessions()
+        }
 
         def _fmt_ts(ts):
             if not ts:
@@ -702,7 +834,7 @@ async def h_list_chats(args: dict):
         for s in sessions:
             is_active = s.get("is_active", False)
             last_active = s.get("last_active")
-            result.append({
+            entry = {
                 "session_id": s.get("id", ""),
                 "title": s.get("title") or "untitled",
                 "status": "active" if is_active else _fmt_ts(last_active),
@@ -710,7 +842,10 @@ async def h_list_chats(args: dict):
                 "source": s.get("source"),
                 "message_count": s.get("message_count", 0),
                 "cwd": s.get("cwd"),
-            })
+            }
+            if s.get("id") in interrupted_ids:
+                entry["interrupted"] = True
+            result.append(entry)
         return _text(json.dumps({"sessions": result, "count": len(result)}, indent=2, default=str))
     except httpx.ConnectError:
         _reset_backend()
@@ -735,11 +870,54 @@ async def h_get_chat(args: dict):
         return _err("backend_error", f"Failed: {e}")
 
 
+# Verbose fields stripped by compact=True: not needed for a quick skim of
+# the conversation, but they're what routinely push a get_messages response
+# past 60K chars (defect #6) — raw reasoning traces and full tool-call/result
+# payloads.
+_COMPACT_DROP_FIELDS = (
+    "reasoning", "reasoning_content", "reasoning_details",
+    "codex_reasoning_items", "codex_message_items", "tool_calls",
+)
+# Text fields eligible for max_chars truncation.
+_TRUNCATABLE_TEXT_FIELDS = ("content", "reasoning", "reasoning_content")
+
+
+def _truncate_messages(messages: list[dict], max_chars: int = 0,
+                       compact: bool = False) -> list[dict]:
+    """Apply the get_messages truncation/compact options (defect #6).
+
+    Never mutates the input messages (copies each dict first). Truncation is
+    never silent: a clipped field gets a sibling '<field>_truncated: true'
+    and '<field>_original_chars' so a caller can tell content was cut rather
+    than that the message was actually short.
+    """
+    if max_chars <= 0 and not compact:
+        return messages
+    out = []
+    for m in messages:
+        m = dict(m)
+        if compact:
+            for field in _COMPACT_DROP_FIELDS:
+                m.pop(field, None)
+        if max_chars > 0:
+            for field in _TRUNCATABLE_TEXT_FIELDS:
+                value = m.get(field)
+                if isinstance(value, str) and len(value) > max_chars:
+                    m[field] = value[:max_chars]
+                    m[f"{field}_truncated"] = True
+                    m[f"{field}_original_chars"] = len(value)
+        out.append(m)
+    return out
+
+
 async def h_get_messages(args: dict):
     b = await _require_backend()
     try:
         last_n = args.get("last_n", 20)
         messages = await b.get_messages(args["session_id"], last_n=last_n)
+        max_chars = int(args.get("max_chars", 0) or 0)
+        compact = bool(args.get("compact", False))
+        messages = _truncate_messages(messages, max_chars=max_chars, compact=compact)
         return _text(json.dumps({
             "session_id": args["session_id"],
             "message_count": len(messages),
@@ -886,13 +1064,24 @@ async def h_backend_status(args: dict):
     try:
         b = await _require_backend()
         health = await b.health()
-        return _text(json.dumps({
+        interrupted = await b.list_interrupted_sessions()
+        result = {
             "connected": True,
             "host": b.host,
             "port": b.port,
             "token_configured": bool(b.token),
             "health": health,
-        }, indent=2))
+            "interrupted_sessions": interrupted,
+        }
+        if interrupted:
+            result["note"] = (
+                f"{len(interrupted)} session(s) look interrupted mid-turn "
+                "(likely a backend restart/crash) and will not reply on "
+                "their own — see interrupted_sessions for ids. Use "
+                "send_prompt on one to nudge it forward, or investigate "
+                "with get_messages first."
+            )
+        return _text(json.dumps(result, indent=2, default=str))
     except Exception as e:
         return _text(json.dumps({
             "connected": False,

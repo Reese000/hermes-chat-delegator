@@ -20,6 +20,8 @@ from hermes_chat_delegator.server import (
     _summarize_event,
     _err,
     _text,
+    _truncate_messages,
+    _resolve_ws_max_size,
     auto_discover_backend,
 )
 
@@ -176,6 +178,116 @@ def mock_backend():
     return backend, transport
 
 
+class TestTruncateMessages:
+    """Unit tests for the get_messages truncation/compact options (defect #6)."""
+
+    def test_no_options_returns_input_unchanged(self):
+        msgs = [{"id": "1", "role": "user", "content": "hi"}]
+        assert _truncate_messages(msgs) == msgs
+
+    def test_max_chars_truncates_and_marks_content(self):
+        msgs = [{"id": "1", "role": "assistant", "content": "x" * 100}]
+        out = _truncate_messages(msgs, max_chars=10)
+        assert out[0]["content"] == "x" * 10
+        assert out[0]["content_truncated"] is True
+        assert out[0]["content_original_chars"] == 100
+        # Input must not be mutated.
+        assert len(msgs[0]["content"]) == 100
+
+    def test_max_chars_does_not_flag_short_content(self):
+        msgs = [{"id": "1", "role": "user", "content": "short"}]
+        out = _truncate_messages(msgs, max_chars=100)
+        assert out[0]["content"] == "short"
+        assert "content_truncated" not in out[0]
+
+    def test_compact_drops_verbose_fields(self):
+        msgs = [{
+            "id": "1", "role": "assistant", "content": "answer",
+            "reasoning": "long chain of thought" * 50,
+            "tool_calls": [{"name": "terminal", "arguments": "{}"}],
+        }]
+        out = _truncate_messages(msgs, compact=True)
+        assert "reasoning" not in out[0]
+        assert "tool_calls" not in out[0]
+        assert out[0]["content"] == "answer"
+
+    def test_combined_max_chars_and_compact(self):
+        msgs = [{
+            "id": "1", "role": "assistant", "content": "y" * 50,
+            "reasoning": "z" * 50,
+        }]
+        out = _truncate_messages(msgs, max_chars=5, compact=True)
+        assert out[0]["content"] == "y" * 5
+        assert "reasoning" not in out[0]
+
+
+class TestResolveWsMaxSize:
+    """Unit tests for the WebSocket max_size resolution (defect #2)."""
+
+    def test_default_is_64mib(self, monkeypatch):
+        monkeypatch.delenv("HERMES_WS_MAX_SIZE", raising=False)
+        assert _resolve_ws_max_size() == 64 * 1024 * 1024
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_WS_MAX_SIZE", "1000")
+        assert _resolve_ws_max_size() == 1000
+
+    def test_env_zero_or_negative_means_unlimited(self, monkeypatch):
+        monkeypatch.setenv("HERMES_WS_MAX_SIZE", "0")
+        assert _resolve_ws_max_size() is None
+        monkeypatch.setenv("HERMES_WS_MAX_SIZE", "-5")
+        assert _resolve_ws_max_size() is None
+
+    def test_default_exceeds_the_websockets_library_default(self, monkeypatch):
+        """The whole point: our floor must be well above `websockets`'
+        built-in 2**20 default that caused defect #2."""
+        monkeypatch.delenv("HERMES_WS_MAX_SIZE", raising=False)
+        assert _resolve_ws_max_size() > 2 ** 20
+
+
+@pytest.mark.asyncio
+class TestRequestRetry:
+    """Unit tests for GuiBackend._request's transient-error retry (defect #4)."""
+
+    async def test_retries_once_on_connect_error_then_succeeds(self):
+        backend = GuiBackend("127.0.0.1", 9999)
+        ok_response = httpx.Response(200, json={"status": "ok"})
+        mock_request = AsyncMock(side_effect=[
+            httpx.ConnectError("refused"),
+            ok_response,
+        ])
+        backend._client.request = mock_request
+
+        resp = await backend._request("GET", "http://x/health", retry_delay=0)
+
+        assert resp is ok_response
+        assert mock_request.call_count == 2
+
+    async def test_gives_up_after_exhausting_retries(self):
+        backend = GuiBackend("127.0.0.1", 9999)
+        mock_request = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        backend._client.request = mock_request
+
+        with pytest.raises(httpx.ConnectError):
+            await backend._request("GET", "http://x/health", retries=2, retry_delay=0)
+
+        assert mock_request.call_count == 3  # initial attempt + 2 retries
+
+    async def test_does_not_retry_http_error_status(self):
+        """A real 404/500 from a reachable server is not a transport
+        failure — must not be retried (raise_for_status happens upstream,
+        _request itself just needs to not eat time retrying a real answer)."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        error_response = httpx.Response(404, json={"error": "not found"})
+        mock_request = AsyncMock(return_value=error_response)
+        backend._client.request = mock_request
+
+        resp = await backend._request("GET", "http://x/api/sessions/missing")
+
+        assert resp is error_response
+        assert mock_request.call_count == 1
+
+
 @pytest.mark.asyncio
 class TestGuiBackendRest:
     async def test_health(self, mock_backend):
@@ -316,13 +428,85 @@ class TestSendPromptStaleResponse:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             result = await backend.send_prompt("test", "New question", timeout=10)
 
         # Must return the NEW answer, not the old one
         assert result["response"] == "NEW ANSWER", (
             f"Got stale response: {result['response']!r} — C2 regression!"
         )
+
+
+@pytest.mark.asyncio
+class TestPollForReplyTimeoutPending:
+    """Regression tests for defect #5: a send_prompt timeout with no new
+    assistant reply must return an unambiguous pending status, never a
+    stale echo of the pre-submit assistant message."""
+
+    async def test_no_new_reply_returns_explicit_pending(self):
+        old_msgs = [
+            {"id": "old1", "role": "user", "content": "Old question"},
+            {"id": "old2", "role": "assistant", "content": "OLD ANSWER"},
+        ]
+
+        class NeverRepliesTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url)
+                if "/messages" in path:
+                    # The new assistant reply NEVER shows up — simulates a
+                    # turn that's still running (or got interrupted) when
+                    # the caller's timeout expires.
+                    return httpx.Response(200, json={"messages": old_msgs})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=NeverRepliesTransport(), timeout=5)
+
+        # timeout=0 skips the (real, 2s-per-iteration) poll loop entirely and
+        # goes straight to the post-loop final check — deterministic and
+        # fast, and still exercises the exact "no new reply" code path the
+        # loop's own timeout would eventually reach.
+        result = await backend._poll_for_reply(
+            "test", last_assistant_id="old2", timeout=0,
+        )
+
+        assert result["response"] is None, (
+            f"Timeout with no new reply must not echo stale content, got: "
+            f"{result['response']!r}"
+        )
+        assert result["timed_out"] is True
+        assert result["status"] == "pending"
+
+    async def test_new_reply_landing_at_deadline_is_not_lost(self):
+        """A reply that arrives exactly at the timeout boundary (the final
+        post-loop check) should still be surfaced — just flagged as late,
+        not silently dropped in favor of a null pending response."""
+        new_msgs = [
+            {"id": "old1", "role": "user", "content": "Old question"},
+            {"id": "old2", "role": "assistant", "content": "OLD ANSWER"},
+            {"id": "new_asst", "role": "assistant", "content": "JUST LANDED"},
+        ]
+
+        class LateReplyTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url)
+                if "/messages" in path:
+                    return httpx.Response(200, json={"messages": new_msgs})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=LateReplyTransport(), timeout=5)
+
+        # timeout=0 skips the poll loop (see note above) so this exercises
+        # the post-loop final check specifically, not the in-loop path
+        # (which would return status="completed" instead of "completed_late").
+        result = await backend._poll_for_reply(
+            "test", last_assistant_id="old2", timeout=0,
+        )
+
+        assert result["response"] == "JUST LANDED"
+        assert result["timed_out"] is True
+        assert result["status"] == "completed_late"
 
 
 @pytest.mark.asyncio
@@ -364,7 +548,7 @@ class TestSendPromptFreshDraftSession:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             result = await backend.send_prompt("brand_new_sess", "hi", timeout=10)
 
         assert result["response"] == "PONG"
@@ -392,7 +576,7 @@ class TestCreateSession:
         ]
 
         captured_ws = []
-        def fake_ws(url):
+        def fake_ws(url, **kwargs):
             ws = FakeWebSocketSendPrompt(ws_frames)
             captured_ws.append(ws)
             return ws
@@ -450,7 +634,7 @@ class TestCreateSession:
         ]
 
         captured_ws = []
-        def fake_ws(url):
+        def fake_ws(url, **kwargs):
             ws = FakeWebSocketSendPrompt(ws_frames)
             captured_ws.append(ws)
             return ws
@@ -479,7 +663,7 @@ class TestCreateSession:
         ws_frames = [{"id": 1, "error": {"code": -1, "message": "nope"}}]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             with pytest.raises(RuntimeError, match="session.create failed"):
                 await backend.create_session()
 
@@ -504,7 +688,7 @@ class TestCreateSession:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             result = await backend.create_session(title="Real Work")
 
         assert result["session_id"] == "new_sess"
@@ -538,7 +722,7 @@ class TestSendPromptStream:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             events = []
             final = None
             async for etype, payload in backend.send_prompt_stream("test", "help me", timeout=10):
@@ -578,7 +762,7 @@ class TestSendPromptStream:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             events = []
             final = None
             async for etype, payload in backend.send_prompt_stream("s", "go", timeout=10):
@@ -602,7 +786,7 @@ class TestSendPromptStream:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             with pytest.raises(RuntimeError, match="agent error mid-turn"):
                 async for _ in backend.send_prompt_stream("s", "x", timeout=10):
                     pass
@@ -620,7 +804,7 @@ class TestSendPromptStream:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             final = None
             async for etype, payload in backend.send_prompt_stream("s", "x", timeout=2):
                 if etype == "__done__":
@@ -653,7 +837,7 @@ class TestBranchSession:
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = lambda url: FakeWebSocketSendPrompt(ws_frames)
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             with pytest.raises(RuntimeError, match="empty"):
                 await backend.branch_session("empty_sess")
 
