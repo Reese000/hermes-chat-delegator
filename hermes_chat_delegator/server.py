@@ -33,6 +33,32 @@ from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
 
+# The `websockets` client library defaults `max_size` to 2**20 (1,048,576
+# bytes) — any single incoming frame larger than that kills the connection
+# with close code 1009 ("message too big") and no further recovery. Hermes'
+# session.resume response ships the ENTIRE session history in one frame, so
+# any session whose stored transcript exceeds ~1MB becomes permanently
+# unpromptable: every future send_prompt's resume step dies the same way,
+# forever (this was defect #2 — confirmed via hermes' own server-side log:
+# "ws closed ... reason=client_disconnect(code=1009,reason=frame exceeds
+# limit of 1048576 bytes)"). Raise the client-side ceiling well past any
+# realistic session transcript. Configurable via env var for sites with
+# unusually large sessions or tighter memory constraints; 0/negative means
+# "no limit" (matches `websockets`' own convention for max_size=None).
+def _resolve_ws_max_size() -> Optional[int]:
+    raw = os.environ.get("HERMES_WS_MAX_SIZE", "")
+    if raw.strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Ignoring non-integer HERMES_WS_MAX_SIZE=%r", raw)
+        else:
+            return value if value > 0 else None
+    return 64 * 1024 * 1024  # 64 MiB default — generous headroom, still bounded
+
+
+_WS_MAX_SIZE: Optional[int] = _resolve_ws_max_size()
+
 
 async def _recv_response(ws, expected_id: int, timeout: float) -> dict:
     """Read WS frames until the JSON-RPC reply with id == expected_id.
@@ -175,7 +201,7 @@ class GuiBackend:
         so session.resume-by-durable-id 404s (backend error 4007) until
         after that first submit has happened.
         """
-        async with websockets.connect(self.ws_url) as ws:
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
             params: dict = {}
             if title:
                 params["title"] = title
@@ -216,7 +242,7 @@ class GuiBackend:
     async def branch_session(self, session_id: str, title: str = "",
                              timeout: float = 15) -> dict:
         """Branch an existing session, copying its full history."""
-        async with websockets.connect(self.ws_url) as ws:
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
             # Resume the source session to get a live id
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
@@ -279,7 +305,7 @@ class GuiBackend:
                 last_assistant_id = m.get("id")
                 break
 
-        async with websockets.connect(self.ws_url) as ws:
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
             # Resume
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
@@ -303,7 +329,7 @@ class GuiBackend:
     async def send_prompt_stream(self, session_id: str, message: str,
                                  timeout: float = 300):
         """Yields (event_type, payload) tuples; last yield is ('__done__', final_dict)."""
-        async with websockets.connect(self.ws_url) as ws:
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
             # Resume
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
