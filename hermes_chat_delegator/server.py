@@ -24,6 +24,7 @@ import sys
 import time
 from functools import partial
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 import websockets
@@ -120,7 +121,13 @@ class GuiBackend:
 
     @property
     def ws_url(self) -> str:
-        return f"ws://{self.host}:{self.port}/api/ws"
+        base = f"ws://{self.host}:{self.port}/api/ws"
+        # /api/ws authenticates via a ?token= query param, not the
+        # X-Hermes-Session-Token header the REST client uses — the header
+        # is silently ignored on the WS upgrade and the handshake 403s.
+        if self.token:
+            base += "?" + urlencode({"token": self.token})
+        return base
 
     async def aclose(self):
         await self._client.aclose()
@@ -385,6 +392,143 @@ class GuiBackend:
             f"session with parent_session_id={session_id!r} found. Backend may have changed."
         )
 
+    async def set_model(self, session_id: str, model: str,
+                        timeout: float = 15) -> dict:
+        """Switch the model on an existing session via slash.exec /model.
+
+        Resumes the session to get a live id, then sends ``/model <model>``
+        through the backend's slash command handler. The backend pins the
+        chosen model to this session (model_override) so subsequent prompts
+        use the new model.
+
+        If the session is busy (a turn is in-flight), sends /interrupt first
+        then retries — the gateway's ``_mirror_slash_side_effects`` refuses
+        to mutate a running session.
+        """
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+            # Resume to get a live session id
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Execute /model command
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp2 = await _recv_response(ws, 2, timeout)
+            if "error" in resp2:
+                err = resp2["error"]
+                raise RuntimeError(
+                    f"slash.exec /model failed: {err.get('message', err)}"
+                )
+
+        result = resp2.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+
+        # The slash worker validates and outputs "✓ Model switched" regardless,
+        # but the gateway's _mirror_slash_side_effects may refuse to apply the
+        # change if the session is busy. Check the warning field for this.
+        if "session busy" in warning.lower():
+            # Send /interrupt to clear the running flag, then retry
+            interrupt_result = await self._interrupt_and_switch(
+                session_id, model, timeout
+            )
+            interrupt_result["interrupted_first"] = True
+            return interrupt_result
+
+        # Check for common error patterns in the slash output
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+        # Also treat gateway-side sync failures as warnings (non-fatal — the
+        # worker DID save to config.yaml, so the model is globally switched;
+        # the per-session override just didn't stick).
+        if warning and "sync failed" in warning.lower():
+            return {
+                "session_id": session_id,
+                "model": model,
+                "output": output,
+                "warning": warning,
+                "status": "partial",
+                "note": (
+                    "Model saved to config.yaml (global default changed), but "
+                    "the per-session override could not be applied. The new "
+                    "model will take effect on the next session/rebuild."
+                ),
+            }
+
+        return {
+            "session_id": session_id,
+            "model": model,
+            "output": output,
+            "warning": warning or None,
+            "status": "ok",
+        }
+
+    async def _interrupt_and_switch(self, session_id: str, model: str,
+                                    timeout: float = 15) -> dict:
+        """Interrupt a busy session then retry the model switch."""
+        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+            # Resume
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Interrupt
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "session.interrupt",
+                "params": {"session_id": live_id},
+            }))
+            # Don't wait long for interrupt — it may already be done
+            try:
+                await _recv_response(ws, 2, timeout=min(timeout, 5))
+            except (asyncio.TimeoutError, Exception):
+                pass  # interrupt is best-effort
+
+            # Brief pause for the running flag to clear
+            await asyncio.sleep(1)
+
+            # Retry /model
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 3, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp3 = await _recv_response(ws, 3, timeout)
+            if "error" in resp3:
+                err = resp3["error"]
+                raise RuntimeError(
+                    f"slash.exec /model failed after interrupt: "
+                    f"{err.get('message', err)}"
+                )
+
+        result = resp3.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+
+        return {
+            "session_id": session_id,
+            "model": model,
+            "output": output,
+            "warning": warning or None,
+            "status": "ok",
+        }
+
     async def send_prompt(self, session_id: str, message: str,
                           timeout: float = 300) -> dict:
         """Send a prompt via WebSocket. Returns when agent finishes or timeout."""
@@ -518,36 +662,54 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
     if not ports:
         return None
 
-    async def _probe(port: int) -> Optional[int]:
+    session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+
+    async def _probe(port: int) -> tuple[int, int] | None:
+        """Returns (port, strength) — 2 for a confirmed usable backend
+        (``/api/sessions`` actually answers with our auth, if any), 1 for a
+        same-process heuristic match we can't confirm we can talk to.
+        Distinct Hermes components can share a host: e.g. the messaging
+        gateway's OpenAI-compatible API server also serves a Hermes-shaped
+        ``/health`` (including a ``version`` key) but gates ``/api/sessions``
+        behind ``Authorization: Bearer <API_SERVER_KEY>`` — a scheme this
+        client never sends. Matching on ``/health`` alone previously locked
+        onto that gateway instead of the actual dashboard backend, and every
+        session/chat call then 401'd with no way to recover short of manually
+        overriding ``HERMES_GUI_PORT``.
+        """
         try:
             async with httpx.AsyncClient(timeout=2) as c:
-                r = await c.get(f"http://{host}:{port}/health")
-                if r.status_code == 200:
-                    body = r.json()
-                    # Positive identification: look for Hermes-specific markers.
-                    if any(k in body for k in ("version", "service", "hermes")):
-                        return port
-                # A headless Hermes backend's /health legitimately returns
-                # {"error": "Headless backend ..."} — indistinguishable from
-                # an unrelated service on /health alone. Confirm identity via
-                # a Hermes-specific endpoint instead of guessing from the
-                # shape of /health (matching "no error key" previously
-                # accepted any unrelated service's bare {"status": "ok"}).
-                r2 = await c.get(f"http://{host}:{port}/api/sessions")
+                headers = {}
+                if session_token:
+                    headers[_SESSION_HEADER_NAME] = session_token
+                r2 = await c.get(f"http://{host}:{port}/api/sessions", headers=headers)
                 if r2.status_code == 200:
                     body2 = r2.json()
                     if isinstance(body2, dict) and "sessions" in body2:
-                        return port
+                        return (port, 2)
+                if r2.status_code == 401:
+                    # Right shape, wrong/missing credential for this port —
+                    # never treat as usable, even as a fallback.
+                    return None
+
+                r = await c.get(f"http://{host}:{port}/health")
+                if r.status_code == 200:
+                    body = r.json()
+                    if any(k in body for k in ("version", "service", "hermes")):
+                        return (port, 1)
         except Exception:
             pass
         return None
 
-    # Probe all candidate ports concurrently
+    # Probe all candidate ports concurrently, then prefer a confirmed
+    # (/api/sessions-verified) match over a /health-only heuristic one;
+    # break ties by lowest port for determinism.
     results = await asyncio.gather(*[_probe(p) for p in sorted(ports)])
-    for r in results:
-        if r is not None:
-            return r
-    return None
+    found = [r for r in results if r is not None]
+    if not found:
+        return None
+    found.sort(key=lambda pr: (-pr[1], pr[0]))
+    return found[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +872,21 @@ TOOLS: list[Tool] = [
             "session_id": {"type": "string", "description": "Durable session ID to fork from."},
             "title": {"type": "string", "description": "Optional title for the new branch (defaults to '<source title> (branch)')."},
         }, "required": ["session_id"]},
+    ),
+    Tool(
+        name="set_model",
+        description=(
+            "Switch the AI model for an existing chat session mid-conversation. "
+            "The model is pinned to this session (persists across turns) until "
+            "changed again. Use the provider/model format, e.g. "
+            "'openrouter/anthropic/claude-sonnet-4'. The output field contains "
+            "the backend's /model command output confirming the switch."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to change model on"},
+            "model": {"type": "string", "description": "Model in provider/model format, e.g. 'openrouter/anthropic/claude-sonnet-4'"},
+            "timeout": {"type": "number", "description": "Max seconds to wait (default 15)"},
+        }, "required": ["session_id", "model"]},
     ),
     Tool(
         name="send_prompt_stream",
@@ -994,6 +1171,24 @@ async def h_fork_chat(args: dict):
         return _err("backend_error", f"Failed: {e}")
 
 
+async def h_set_model(args: dict):
+    b = await _require_backend()
+    try:
+        result = await b.set_model(
+            args["session_id"],
+            args["model"],
+            timeout=args.get("timeout", 15),
+        )
+        return _text(json.dumps(result, indent=2, default=str))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except RuntimeError as e:
+        return _err("backend_error", str(e))
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
 async def h_send_prompt_stream(args: dict):
     b = await _require_backend()
     session_id = args["session_id"]
@@ -1097,6 +1292,7 @@ HANDLERS = {
     "send_prompt": h_send_prompt,
     "create_chat": h_create_chat,
     "fork_chat": h_fork_chat,
+    "set_model": h_set_model,
     "send_prompt_stream": h_send_prompt_stream,
     "rename_chat": h_rename_chat,
     "delete_chat": h_delete_chat,

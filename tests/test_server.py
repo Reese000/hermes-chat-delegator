@@ -842,6 +842,121 @@ class TestBranchSession:
                 await backend.branch_session("empty_sess")
 
 
+@pytest.mark.asyncio
+class TestSetModel:
+    """Unit tests for GuiBackend.set_model (slash.exec /model)."""
+
+    async def test_successful_model_switch(self):
+        """set_model resumes session, calls slash.exec /model, returns ok."""
+        transport = MockTransport({
+            "/health": (200, {"status": "ok"}),
+            "/api/sessions": (200, {"sessions": []}),
+        })
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+
+        ws_frames = [
+            # session.resume response
+            {"id": 1, "result": {"session_id": "live_xyz"}},
+            # slash.exec /model response
+            {"id": 2, "result": {
+                "output": "Switched to openrouter/anthropic/claude-sonnet-4 (session only).",
+            }},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            result = await backend.set_model("durable_123", "openrouter/anthropic/claude-sonnet-4")
+
+        assert result["status"] == "ok"
+        assert result["session_id"] == "durable_123"
+        assert result["model"] == "openrouter/anthropic/claude-sonnet-4"
+        assert "Switched" in result["output"]
+
+    async def test_slash_exec_error_raises(self):
+        """slash.exec returning an error raises RuntimeError."""
+        transport = MockTransport({
+            "/health": (200, {"status": "ok"}),
+            "/api/sessions": (200, {"sessions": []}),
+        })
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+
+        ws_frames = [
+            {"id": 1, "result": {"session_id": "live_xyz"}},
+            {"id": 2, "error": {"code": 4004, "message": "empty command"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            with pytest.raises(RuntimeError, match="slash.exec"):
+                await backend.set_model("durable_123", "bad/model")
+
+    async def test_busy_session_interrupts_and_retries(self):
+        """When slash.exec returns a 'session busy' warning, set_model
+        should send session.interrupt and retry the model switch."""
+        transport = MockTransport({
+            "/health": (200, {"status": "ok"}),
+            "/api/sessions": (200, {"sessions": []}),
+        })
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+
+        # Track all WS frames across two connections
+        call_count = {"n": 0}
+        frames_per_call = [
+            # First connection: resume + slash.exec (busy warning)
+            [
+                {"id": 1, "result": {"session_id": "live_abc"}},
+                {"id": 2, "result": {
+                    "output": "  \u2713 Model switched: xiaomi/mimo-v2.5",
+                    "warning": "session busy \u2014 /interrupt the current turn before running /model",
+                }},
+            ],
+            # Second connection: resume + interrupt + slash.exec (success)
+            [
+                {"id": 1, "result": {"session_id": "live_abc"}},
+                {"id": 2, "result": {}},  # interrupt response
+                {"id": 3, "result": {
+                    "output": "  \u2713 Model switched: xiaomi/mimo-v2.5",
+                }},
+            ],
+        ]
+
+        def make_ws(url, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            return FakeWebSocketSendPrompt(frames_per_call[idx])
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = make_ws
+            # Patch asyncio.sleep to avoid real delay
+            with patch("hermes_chat_delegator.server.asyncio.sleep", new_callable=AsyncMock):
+                result = await backend.set_model("durable_123", "xiaomi/mimo-v2.5")
+
+        assert result["status"] == "ok"
+        assert result["interrupted_first"] is True
+        assert call_count["n"] == 2  # two WS connections
+
+    async def test_resume_failure_raises(self):
+        """A failed session.resume raises RuntimeError."""
+        transport = MockTransport({
+            "/health": (200, {"status": "ok"}),
+            "/api/sessions": (200, {"sessions": []}),
+        })
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+
+        ws_frames = [
+            {"id": 1, "error": {"code": 4001, "message": "session not found"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            with pytest.raises(RuntimeError, match="resume failed"):
+                await backend.set_model("nonexistent", "some/model")
+
+
 # ---------------------------------------------------------------------------
 # auto_discover_backend
 # ---------------------------------------------------------------------------
@@ -927,3 +1042,33 @@ class TestAutoDiscoverBackend:
             port = await auto_discover_backend("127.0.0.1")
 
         assert port == 7000
+
+    async def test_gated_gateway_impostor_loses_to_unauthenticated_dashboard(self):
+        """Regression test: a Hermes messaging-gateway API server can serve a
+        Hermes-shaped /health (version key present) on a lower port while
+        gating /api/sessions behind Authorization: Bearer <API_SERVER_KEY> —
+        a scheme this client never sends. It must not win over the actual
+        headless dashboard backend (unauthenticated /api/sessions) sitting on
+        a higher port, even though it's probed first and matches on /health.
+        """
+        transport = PortRoutingTransport({
+            8642: {
+                "/health": (200, {"status": "ok", "platform": "hermes-agent", "version": "0.18.2"}),
+                "/api/sessions": (401, {"error": "unauthorized"}),
+            },
+            41689: {
+                "/health": (404, {"error": "not found"}),
+                "/api/sessions": (200, {"sessions": [], "total": 0}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8642    0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:41689   0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient", side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 41689
