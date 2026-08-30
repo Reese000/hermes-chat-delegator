@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+from hermes_chat_delegator import server
 from hermes_chat_delegator.server import (
+    BackendAmbiguous,
     GuiBackend,
+    WsAuthFailure,
     _safe_epoch,
     _summarize_event,
     _err,
@@ -1072,3 +1076,1074 @@ class TestAutoDiscoverBackend:
             port = await auto_discover_backend("127.0.0.1")
 
         assert port == 41689
+
+    async def test_prefers_live_instance_over_stale_on_lower_port(self):
+        """Regression test for the exact incident topology:
+        Two backends alive simultaneously:
+          - stale on port 8765, sessions from 2026-07-31 (3 weeks old),
+            auth_required=false (answers /api/sessions with 200)
+          - live on port 32556, sessions from minutes ago,
+            auth_required=false
+
+        The stale instance on the LOWER port must NOT win.  The live
+        instance has more recent sessions and must be selected.
+        """
+        now = time.time()
+        transport = PortRoutingTransport({
+            8765: {  # stale instance — old sessions, lower port
+                "/health": (200, {"ok": True, "version": "0.20.2", "auth_required": False}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "old_1", "last_active": now - 2_000_000},  # ~23 days ago
+                    {"id": "old_2", "last_active": now - 3_000_000},
+                ]}),
+            },
+            32556: {  # live instance — recent sessions, higher port
+                "/health": (200, {"ok": True, "version": "0.20.2", "auth_required": False}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "live_1", "last_active": now - 300},  # 5 min ago
+                    {"id": "live_2", "last_active": now - 60},   # 1 min ago
+                ]}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8765     0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:32556    0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 32556, (
+            f"Live instance on 32556 (recent sessions) must be preferred "
+            f"over stale instance on 8765 (old sessions), got port={port}"
+        )
+
+    async def test_ambiguous_recency_returns_none(self):
+        """When two confirmed instances have indistinguishable recency
+        (within 60s), auto_discover must raise BackendAmbiguous rather
+        than silently picking one — a wrong choice invites destructive
+        recovery."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            8000: {
+                "/health": (200, {"ok": True, "version": "0.20.2"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "s1", "last_active": now - 10},  # 10s ago
+                ]}),
+            },
+            9000: {
+                "/health": (200, {"ok": True, "version": "0.20.2"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "s2", "last_active": now - 30},  # 30s ago — within 60s
+                ]}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8000    0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:9000    0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            with pytest.raises(BackendAmbiguous) as exc_info:
+                await auto_discover_backend("127.0.0.1")
+
+        assert set(exc_info.value.ports) == {8000, 9000}
+        assert "8000" in str(exc_info.value)
+        assert "9000" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Resilience: re-discovery on backend restart / stale token
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRequireBackendReDiscovery:
+    """_require_backend must re-discover when the cached backend dies."""
+
+    async def test_cached_backend_replaced_on_health_failure(self):
+        """When the cached backend fails health check, _require_backend
+        re-discovers and returns a new backend."""
+        import hermes_chat_delegator.server as mod
+        # Clear any cached backend
+        mod._backend = None
+
+        # Simulate auto_discover_backend finding port 22222
+        with patch.object(mod, "auto_discover_backend", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = 22222
+            with patch.object(mod, "_port_answers", new_callable=AsyncMock) as mock_port:
+                mock_port.return_value = False  # pinned port dead
+                b = await mod._require_backend()
+
+        assert b.port == 22222
+        mock_disc.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestRetryHandler:
+    """_retry_handler must re-discover and retry on connection/auth failures."""
+
+    async def test_connect_error_triggers_rediscovery_and_retry(self):
+        """A ConnectError on first call triggers re-discovery; second call succeeds."""
+        import hermes_chat_delegator.server as mod
+
+        call_count = {"n": 0}
+
+        async def flaky_operation():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise httpx.ConnectError("Connection refused")
+            return _text('{"ok": true}')
+
+        with patch.object(mod, "_reconnect_backend", new_callable=AsyncMock) as mock_reconnect:
+            mock_reconnect.return_value = GuiBackend("127.0.0.1", 9999)
+            result = await mod._retry_handler(flaky_operation)
+
+        data = json.loads(result[0].text)
+        assert data == {"ok": True}
+        mock_reconnect.assert_called_once()
+        assert call_count["n"] == 2
+
+    async def test_ws_auth_failure_triggers_rediscovery_and_retry(self):
+        """A WsAuthFailure triggers re-discovery; retry with new token succeeds."""
+        import hermes_chat_delegator.server as mod
+
+        call_count = {"n": 0}
+
+        async def auth_fails_first():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise WsAuthFailure(9999, 403, "stale token")
+            return _text('{"ok": true}')
+
+        with patch.object(mod, "_reconnect_backend", new_callable=AsyncMock) as mock_reconnect:
+            mock_reconnect.return_value = GuiBackend("127.0.0.1", 9999)
+            result = await mod._retry_handler(auth_fails_first)
+
+        data = json.loads(result[0].text)
+        assert data == {"ok": True}
+        assert call_count["n"] == 2
+
+    async def test_genuinely_down_returns_honest_error(self):
+        """When re-discovery finds nothing, returns not_connected error."""
+        import hermes_chat_delegator.server as mod
+
+        async def always_fails():
+            raise httpx.ConnectError("Connection refused")
+
+        with patch.object(mod, "_reconnect_backend", new_callable=AsyncMock) as mock_reconnect:
+            mock_reconnect.side_effect = RuntimeError("unreachable")
+            result = await mod._retry_handler(always_fails)
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "not_connected"
+        assert data["error"]["retryable"] is True
+        assert "re-discovery" in data["error"]["message"].lower()
+
+    async def test_retry_fails_returns_retry_error(self):
+        """When re-discovery succeeds but retry also fails, returns the retry error."""
+        import hermes_chat_delegator.server as mod
+
+        async def always_auth_fails():
+            raise WsAuthFailure(9999, 403, "still stale")
+
+        with patch.object(mod, "_reconnect_backend", new_callable=AsyncMock) as mock_reconnect:
+            mock_reconnect.return_value = GuiBackend("127.0.0.1", 9999)
+            result = await mod._retry_handler(always_auth_fails)
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "ws_auth_failed"
+        assert data["error"]["retryable"] is True
+
+
+@pytest.mark.asyncio
+class TestFindOrDiscoverBackend:
+    """_find_or_discover_backend returns None when genuinely down."""
+
+    async def test_returns_none_when_nothing_found(self):
+        import hermes_chat_delegator.server as mod
+        mod._backend = None
+
+        with patch.object(mod, "auto_discover_backend", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = None
+            with patch.object(mod, "_port_answers", new_callable=AsyncMock) as mock_port:
+                mock_port.return_value = False
+                result = await mod._find_or_discover_backend()
+
+        assert result is None
+
+    async def test_returns_backend_when_discovered(self):
+        import hermes_chat_delegator.server as mod
+        mod._backend = None
+
+        with patch.object(mod, "auto_discover_backend", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = 55555
+            result = await mod._find_or_discover_backend()
+
+        assert result is not None
+        assert result.port == 55555
+
+
+@pytest.mark.asyncio
+class TestBackendStatusReDiscovery:
+    """h_backend_status must re-discover when initial connection fails."""
+
+    async def test_re_discovers_on_connection_failure(self):
+        """backend_status re-discovers and returns connected on fresh backend."""
+        import hermes_chat_delegator.server as mod
+
+        # Pre-populate with a dead backend that raises on health check
+        dead = GuiBackend("127.0.0.1", 11111)
+        dead._client = httpx.AsyncClient(
+            transport=MockTransport({}), timeout=2,
+        )
+        mod._backend = dead
+
+        # The fresh backend has a good transport
+        fresh_transport = MockTransport({
+            "/health": (200, {"status": "ok", "version": "0.20.2"}),
+            "/api/sessions": (200, {"sessions": []}),
+            "/api/sessions/interrupted": (200, {"sessions": []}),
+        })
+
+        async def fake_find():
+            fresh = GuiBackend("127.0.0.1", 22222)
+            fresh._client = httpx.AsyncClient(transport=fresh_transport, timeout=5)
+            mod._backend = fresh
+            return fresh
+
+        # Force _require_backend to fail by making health raise
+        async def failing_health():
+            raise httpx.ConnectError("dead")
+
+        # Patch _require_backend to raise, triggering the except path in h_backend_status
+        with patch.object(mod, "_require_backend", side_effect=RuntimeError("not connected")), \
+             patch.object(mod, "_find_or_discover_backend", side_effect=fake_find):
+            result = await mod.h_backend_status({})
+
+        data = json.loads(result[0].text)
+        assert data["connected"] is True
+        assert data["port"] == 22222
+
+
+# ---------------------------------------------------------------------------
+# Unpromptable draft: create_chat(no initial_message) -> send_prompt flow
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestUnpromptableDraft:
+    """Verify that a draft session (created without initial_message) can be
+    successfully prompted via send_prompt — the draft mapping bootstraps
+    the durable row by submitting against the live id directly."""
+
+    async def test_send_prompt_boots_draft_durable_row(self):
+        """Draft session → send_prompt succeeds: submits against live_id,
+        skips session.resume, polls durable id for the reply."""
+        new_msgs = [
+            {"id": "u1", "role": "user", "content": "hello"},
+            {"id": "a1", "role": "assistant", "content": "HI THERE"},
+        ]
+
+        # Call tracking: first GET /messages (baseline) returns empty (draft
+        # has no prior messages), second GET returns the new reply.
+        call_count = {"n": 0}
+
+        class DraftTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, req):
+                p = req.url.raw_path
+                if isinstance(p, bytes):
+                    p = p.decode()
+                if "/messages" in p:
+                    call_count["n"] += 1
+                    if call_count["n"] == 1:
+                        # Baseline: no prior messages for a draft
+                        return httpx.Response(200, json={"messages": []})
+                    return httpx.Response(200, json={"messages": new_msgs})
+                if "/health" in p:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/sessions" in p:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=DraftTransport(), timeout=5)
+
+        # Step 1: create_session without initial_message (draft)
+        ws_frames_create = [
+            {"id": 1, "result": {
+                "session_id": "live_draft_abc",
+                "stored_session_id": "durable_draft_001",
+                "info": {},
+            }},
+        ]
+
+        captured_ws = []
+        def fake_ws_create(url, **kwargs):
+            ws = FakeWebSocketSendPrompt(ws_frames_create)
+            captured_ws.append(ws)
+            return ws
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = fake_ws_create
+            result = await backend.create_session(title="Draft Test")
+
+        assert result["session_id"] == "durable_draft_001"
+        assert result["live_session_id"] == "live_draft_abc"
+        # Draft was registered
+        assert "durable_draft_001" in backend._draft_sessions
+        assert backend._draft_sessions["durable_draft_001"]["live_session_id"] == "live_draft_abc"
+
+        # Step 2: send_prompt against the draft session
+        ws_frames_prompt = [
+            # prompt.submit ack (NO session.resume — draft path skips it)
+            {"id": 1, "result": {"status": "streaming"}},
+        ]
+
+        def fake_ws_prompt(url, **kwargs):
+            ws = FakeWebSocketSendPrompt(ws_frames_prompt)
+            captured_ws.append(ws)
+            return ws
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = fake_ws_prompt
+            result = await backend.send_prompt("durable_draft_001", "hello", timeout=10)
+
+        assert result["response"] == "HI THERE"
+        # Draft mapping was consumed (popped)
+        assert "durable_draft_001" not in backend._draft_sessions
+
+        # Verify the WS calls: first was session.create, second was prompt.submit
+        # with NO session.resume in between
+        sent_create = json.loads(captured_ws[0]._sent[0])
+        assert sent_create["method"] == "session.create"
+        sent_prompt = json.loads(captured_ws[1]._sent[0])
+        assert sent_prompt["method"] == "prompt.submit"
+        # Submitted against the live id, not the durable id
+        assert sent_prompt["params"]["session_id"] == "live_draft_abc"
+
+    async def test_draft_mapping_survives_create_then_prompt(self):
+        """After create_session (draft), send_prompt pops the draft entry
+        and uses it. A second send_prompt on the same id falls through to
+        the normal resume path."""
+        class SimpleTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, req):
+                p = req.url.raw_path
+                if isinstance(p, bytes):
+                    p = p.decode()
+                if "/messages" in p:
+                    return httpx.Response(200, json={"messages": []})
+                if "/health" in p:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/sessions" in p:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=SimpleTransport(), timeout=5)
+
+        # Create draft
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt([
+                {"id": 1, "result": {"session_id": "live_x", "stored_session_id": "durable_x", "info": {}}},
+            ])
+            await backend.create_session()
+
+        assert "durable_x" in backend._draft_sessions
+
+        # First send_prompt: consumes draft, submits against live_id (no resume)
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt([
+                {"id": 1, "result": {"status": "streaming"}},
+            ])
+            await backend.send_prompt("durable_x", "first msg", timeout=5)
+
+        assert "durable_x" not in backend._draft_sessions  # consumed
+
+        # Second send_prompt: falls through to normal resume path
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt([
+                {"id": 1, "result": {"session_id": "live_x"}},
+                {"id": 2, "result": {"status": "streaming"}},
+            ])
+            await backend.send_prompt("durable_x", "second msg", timeout=5)
+
+        # Both calls succeeded — no crash
+
+    async def test_send_prompt_stream_handles_draft(self):
+        """Draft session → send_prompt_stream also uses the draft path."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        # Register a draft manually
+        backend._draft_sessions["durable_s"] = {
+            "live_session_id": "live_s",
+            "created_at": time.time(),
+        }
+
+        ws_frames = [
+            # prompt.submit ack (no session.resume — draft path)
+            {"id": 1, "result": {"status": "streaming"}},
+            # Event stream
+            {"method": "event", "params": {"type": "message.start", "session_id": "live_s", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_s", "payload": {"delta": "Draft reply"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_s", "payload": {"content": "Draft reply"}}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            final = None
+            async for etype, payload in backend.send_prompt_stream("durable_s", "go", timeout=10):
+                if etype == "__done__":
+                    final = payload
+                    break
+
+        assert final is not None
+        assert final["response"] == "Draft reply"
+        assert "durable_s" not in backend._draft_sessions  # consumed
+
+    async def test_residual_4007_translates_to_unpromptable_draft(self):
+        """When send_prompt hits a 4007 on a session with no draft mapping
+        (e.g. MCP server restarted and lost the mapping), the error is
+        translated into a clear unpromptable_draft message."""
+        import hermes_chat_delegator.server as mod
+
+        # Patch _require_backend to return a backend whose send_prompt raises 4007
+        class FailingBackend:
+            port = 9999
+            async def send_prompt(self, sid, msg, timeout=300):
+                raise RuntimeError("resume failed: {'code': 4007, 'message': 'session not found'}")
+            async def send_prompt_stream(self, sid, msg, timeout=300):
+                raise RuntimeError("resume failed: {'code': 4007, 'message': 'session not found'}")
+
+        with patch.object(mod, "_require_backend", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = FailingBackend()
+            result = await mod.h_send_prompt({"session_id": "dead_draft", "message": "test"})
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "unpromptable_draft"
+        assert "no durable row" in data["error"]["message"]
+        assert "create_chat with initial_message" in data["error"]["message"]
+
+    async def test_residual_4007_stream_translates_to_unpromptable_draft(self):
+        """Same translation for send_prompt_stream."""
+        import hermes_chat_delegator.server as mod
+
+        class FailingBackend:
+            port = 9999
+            async def send_prompt_stream(self, sid, msg, timeout=300):
+                # Must be an async generator (yield), not just raise
+                raise RuntimeError("resume failed: {'code': 4007, 'message': 'session not found'}")
+                yield  # pragma: no cover — makes this an async generator
+
+        with patch.object(mod, "_require_backend", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = FailingBackend()
+            # Need a request context for progress notifications
+            mock_ctx = MagicMock()
+            mock_ctx.meta = None
+            mock_server = MagicMock()
+            mock_server.request_context = mock_ctx
+            with patch.object(mod, "_current_server", mock_server):
+                result = await mod.h_send_prompt_stream({
+                    "session_id": "dead_draft", "message": "test"
+                })
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "unpromptable_draft"
+        assert "no durable row" in data["error"]["message"]
+
+    async def test_non_4007_runtime_error_passes_through(self):
+        """A RuntimeError that is NOT a 4007/session-not-found must still
+        surface as a backend_error, not an unpromptable_draft."""
+        import hermes_chat_delegator.server as mod
+
+        class OtherErrorBackend:
+            port = 9999
+            async def send_prompt(self, sid, msg, timeout=300):
+                raise RuntimeError("something else went wrong")
+
+        with patch.object(mod, "_require_backend", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = OtherErrorBackend()
+            result = await mod.h_send_prompt({"session_id": "x", "message": "y"})
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "backend_error"
+        assert "something else went wrong" in data["error"]["message"]
+
+
+# ===========================================================================
+# Identity-aware backend resolution: RED tests
+# These must FAIL against the current code, then GREEN after fixes.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestHeadlessHealthBody:
+    """The liveness gate must NOT be /health. Two real backends prove this:
+
+    - 59681: no /health endpoint at all (404), but serves /api/sessions
+      with the correct token. This IS the working backend.
+    - 8642: perfect /health with {"platform":"hermes-agent","version":"..."},
+      but 401 on every real operation. This is a SECOND instance with a
+      different token — useless.
+
+    The authenticated /api/sessions probe is the only liveness test that
+    answers all three questions: is something listening, is it Hermes,
+    does my token work here.
+    """
+
+    async def test_no_health_endpoint_but_valid_sessions_is_alive(self):
+        """59681-style — backend has no /health (404) but serves
+        /api/sessions with auth. is_alive() must succeed here.
+
+        NOTE: old code (health() as gate) ALSO passes this test because
+        health() returns a truthy dict on 404 — so this is NOT a
+        regression test for old code. It is a guard that prevents future
+        regressions from breaking the 59681-style backend. The paired
+        test_perfect_health_but_401_sessions_is_not_alive IS the
+        regression test — it fails with old code.
+        """
+        import hermes_chat_delegator.server as mod
+        mod._backend = None
+
+        class NoHealthButSessionsTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(404, json={"error": "not found"})
+                if "/api/sessions" in path:
+                    return httpx.Response(200, json={"sessions": [
+                        {"id": "real_session", "last_active": 1000},
+                    ]})
+                return httpx.Response(404, json={})
+
+        working = GuiBackend("127.0.0.1", 59681, token="real-token")
+        working._client = httpx.AsyncClient(
+            transport=NoHealthButSessionsTransport(), timeout=5
+        )
+        mod._backend = working
+
+        # Mock auto_discover to prevent real netstat from finding 59681
+        async def fake_discover(host="127.0.0.1"):
+            return None  # nothing found
+
+        with patch.object(mod, "auto_discover_backend", side_effect=fake_discover), \
+             patch.object(mod, "_port_answers", new_callable=AsyncMock, return_value=False), \
+             patch.dict(os.environ, {"HERMES_GUI_PORT": "", "HERMES_DASHBOARD_SESSION_TOKEN": ""}, clear=False):
+            # _require_backend should keep this backend — is_alive() should
+            # succeed via /api/sessions even though /health returns 404
+            result = await mod._require_backend()
+
+        assert result.port == 59681, (
+            f"Backend on 59681 serves /api/sessions — must not be evicted; "
+            f"got port={result.port}"
+        )
+
+    async def test_perfect_health_but_401_sessions_is_not_alive(self):
+        """RED: 8642-style — backend has perfect /health with hermes-agent
+        banner, but 401 on /api/sessions (wrong token). _require_backend
+        must NOT treat this as alive. Current code: health() returns truthy
+        → cached → every real operation fails."""
+        import hermes_chat_delegator.server as mod
+        mod._backend = None
+
+        class PerfectHealthButUnauthorizedTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(200, json={
+                        "status": "ok", "platform": "hermes-agent",
+                        "version": "0.20.2",
+                    })
+                if "/api/sessions" in path:
+                    return httpx.Response(401, json={"error": "unauthorized"})
+                return httpx.Response(404, json={})
+
+        wrong_token = GuiBackend("127.0.0.1", 8642, token="wrong-token")
+        wrong_token._client = httpx.AsyncClient(
+            transport=PerfectHealthButUnauthorizedTransport(), timeout=5
+        )
+        mod._backend = wrong_token
+
+        # _require_backend should reject this — is_alive() fails on 401
+        # Even though health() succeeds, the authenticated probe fails.
+        discover_calls = []
+
+        async def fake_discover(host="127.0.0.1"):
+            discover_calls.append(host)
+            return 99999
+
+        with patch.object(mod, "auto_discover_backend", side_effect=fake_discover), \
+             patch.object(mod, "_port_answers", new_callable=AsyncMock, return_value=False), \
+             patch.dict(os.environ, {"HERMES_GUI_PORT": "", "HERMES_DASHBOARD_SESSION_TOKEN": ""}, clear=False):
+            result = await mod._require_backend()
+
+        assert result.port == 99999, (
+            f"Backend on 8642 returns 401 on /api/sessions — must be evicted; "
+            f"got port={result.port}"
+        )
+
+
+@pytest.mark.asyncio
+class TestSplitPortTokenResolution:
+    """Bug (b): port and token resolved independently by two first-match scans.
+    Two backends on different ports with different tokens — the resolver must
+    find the (port, token) pair that authenticates, not mix them."""
+
+    async def test_correct_token_selected_for_port(self):
+        """Two backends on different ports: discovery must pick the one that
+        has the most recent sessions, not the one on the lower port."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            8001: {
+                "/health": (200, {"version": "1.0"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "sess_X", "last_active": now - 2000000},  # ~23 days ago
+                ]}),
+            },
+            9002: {
+                "/health": (200, {"version": "1.0"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "sess_Z", "last_active": now - 50},  # 50s ago
+                ]}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8001    0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:9002    0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 9002, (
+            f"Expected port 9002 (more recent sessions), got {port}"
+        )
+
+    async def test_401_on_port_demotes_it(self):
+        """When a port returns 401 on /api/sessions (auth required),
+        it must not be selected even if /health answers."""
+        transport = PortRoutingTransport({
+            8001: {
+                "/health": (200, {"version": "1.0", "service": "hermes"}),
+                "/api/sessions": (401, {"error": "unauthorized"}),
+            },
+            9002: {
+                "/health": (200, {"version": "1.0"}),
+                "/api/sessions": (200, {"sessions": []}),
+            },
+        })
+        netstat_output = (
+            "  TCP    127.0.0.1:8001    0.0.0.0:0    LISTENING    111\n"
+            "  TCP    127.0.0.1:9002    0.0.0.0:0    LISTENING    222\n"
+        )
+
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=netstat_output)
+            port = await auto_discover_backend("127.0.0.1")
+
+        assert port == 9002, (
+            f"Port 8001 returned 401 — must not be selected, got {port}"
+        )
+
+    async def test_non_hermes_service_rejected_by_port_answers(self):
+        """_port_answers must require positive Hermes identity, not just HTTP.
+
+        Foundry Manager on port 3000 returns 200 with unrelated JSON on
+        /api/sessions.  A service returning 200 with an unrelated body
+        must NOT be accepted as a Hermes backend.
+        """
+        import hermes_chat_delegator.server as mod
+
+        class NonHermesTransport(httpx.AsyncBaseTransport):
+            """Simulates a non-Hermes service (e.g. Foundry Manager) that
+            returns 200 with unrelated JSON on /api/sessions."""
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={
+                    "tasks": [], "total": 0,  # FM shape, not Hermes
+                })
+
+        non_hermes_client = httpx.AsyncClient(
+            transport=NonHermesTransport(), timeout=2
+        )
+
+        # _port_answers creates its own AsyncClient — mock it
+        with patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   return_value=non_hermes_client):
+            result = await mod._port_answers("127.0.0.1", 3000)
+
+        assert result is False, (
+            "_port_answers must reject non-Hermes service returning "
+            "200 with unrelated JSON (no 'sessions' key)"
+        )
+
+
+@pytest.mark.asyncio
+class TestSessionScoped404TriggersRediscovery:
+    """Bug (c): a 404 on a session-scoped endpoint when the session was
+    recently visible is a routing failure (split instance), not a missing
+    session. Must trigger re-discovery and retry."""
+
+    async def test_404_on_known_session_triggers_retry_via_handler(self):
+        """get_messages for a session that list_chats just returned, going
+        through _retry_handler: a 404 must trigger re-discovery and retry
+        on the correct backend.
+
+        GREEN: _retry_handler catches HTTPStatusError(404), calls
+        _reconnect_backend, retries, and returns success.
+        """
+        import hermes_chat_delegator.server as mod
+
+        # Backend A (cached): list_chats returns session X, but get_messages
+        # for X returns 404 — this is the split-instance signature.
+        class SplitTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/api/sessions/X/messages" in path:
+                    # Split instance: 404 for session X
+                    return httpx.Response(404, json={"error": "session not found"})
+                if "/api/sessions" in path and "/messages" not in path:
+                    return httpx.Response(200, json={"sessions": [{"id": "X"}]})
+                return httpx.Response(404, json={})
+
+        fresh_transport = MockTransport({
+            "/health": (200, {"status": "ok", "version": "0.20.2"}),
+            "/api/sessions/X/messages": (200, {"messages": [
+                {"id": "m1", "role": "user", "content": "hi"},
+                {"id": "m2", "role": "assistant", "content": "hello"},
+            ]}),
+        })
+
+        # Pre-cache backend A (the split instance)
+        split_backend = GuiBackend("127.0.0.1", 11111)
+        split_backend._client = httpx.AsyncClient(transport=SplitTransport(), timeout=5)
+        mod._backend = split_backend
+
+        fresh_backend = GuiBackend("127.0.0.1", 22222)
+        fresh_backend._client = httpx.AsyncClient(transport=fresh_transport, timeout=5)
+
+        # Patch _require_backend so the retry path returns the fresh backend
+        # instead of running real auto_discover_backend (which finds live ports)
+        call_count = {"n": 0}
+        async def fake_require():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call: return the split backend (will 404)
+                return split_backend
+            # Retry: return the fresh backend
+            return fresh_backend
+
+        with patch.object(mod, "_require_backend", side_effect=fake_require), \
+             patch.object(mod, "_reconnect_backend", new_callable=AsyncMock):
+            result = await mod.h_get_messages({"session_id": "X", "last_n": 5})
+
+        data = json.loads(result[0].text)
+        # Must NOT be an error — the retry should have found the right backend
+        assert "error" not in data, (
+            f"404 on known session must trigger re-discovery, got: {data}"
+        )
+        assert data["message_count"] == 2
+        assert data["messages"][-1]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+class TestDraftSessionRecovery:
+    """Bug (d): create_chat returns a draft with persisted=false, and if the
+    bootstrapping send_prompt times out, the session is silently lost —
+    get_chat reports session_not_found. A draft that cannot be recovered
+    after a timeout is a data-loss bug."""
+
+    async def test_draft_timeout_preserves_session_id(self):
+        """When send_prompt on a draft times out, the response must include
+        the session_id so the caller can retry — not silently lose it."""
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+
+        # Register a draft
+        backend._draft_sessions["durable_draft"] = {
+            "live_session_id": "live_draft",
+            "created_at": time.time(),
+        }
+
+        # WS: prompt.submit succeeds, but poll times out
+        ws_frames = [
+            {"id": 1, "result": {"status": "streaming"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            # timeout=0 skips the poll loop, simulating a timeout
+            result = await backend.send_prompt("durable_draft", "hello", timeout=0)
+
+        # The result must indicate timeout AND preserve the session_id
+        assert result["timed_out"] is True
+        assert result["session_id"] == "durable_draft"
+
+    async def test_4007_fallback_to_direct_submit(self):
+        """When session.resume fails with 4007 (durable row not yet created),
+        send_prompt must fall back to direct prompt.submit against the durable
+        id — bootstrapping the durable row, same as the draft path.
+
+        RED: current code raises RuntimeError on 4007 with no fallback.
+        This is the data-loss path: both create_chat(with initial_message)
+        and create_chat(no message) + send_prompt hit this when the MCP
+        server restarts and loses the in-memory draft mapping.
+        """
+        call_count = {"n": 0}
+
+        class FourOhSevenTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/messages" in path:
+                    call_count["n"] += 1
+                    if call_count["n"] == 1:
+                        # Baseline: no prior messages
+                        return httpx.Response(200, json={"messages": []})
+                    # After prompt.submit: new assistant reply appears
+                    return httpx.Response(200, json={"messages": [
+                        {"id": "u1", "role": "user", "content": "hello"},
+                        {"id": "a1", "role": "assistant", "content": "HI THERE"},
+                    ]})
+                if "/sessions" in path:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=FourOhSevenTransport(), timeout=5)
+
+        # First WS call: session.resume → 4007 error
+        # Second WS call: prompt.submit (fallback) → success
+        ws_frames = [
+            {"id": 1, "error": {"code": 4007, "message": "session not found"}},
+            {"id": 2, "result": {"status": "streaming"}},
+        ]
+
+        captured_ws = []
+        def fake_ws(url, **kwargs):
+            ws = FakeWebSocketSendPrompt(ws_frames)
+            captured_ws.append(ws)
+            return ws
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = fake_ws
+            # No draft mapping — simulating MCP server restart
+            result = await backend.send_prompt("durable_sess", "hello", timeout=10)
+
+        # Must succeed via fallback, not raise RuntimeError
+        assert result["response"] == "HI THERE", (
+            f"Expected fallback to succeed, got: {result}"
+        )
+        # Verify: first call was session.resume (got 4007),
+        # second was prompt.submit (direct against durable id)
+        assert len(captured_ws) == 1  # single WS connection
+        sent = [json.loads(s) for s in captured_ws[0]._sent]
+        assert sent[0]["method"] == "session.resume"
+        assert sent[1]["method"] == "prompt.submit"
+        assert sent[1]["params"]["session_id"] == "durable_sess"
+
+    async def test_4007_fallback_also_works_for_initial_message_path(self):
+        """create_chat with initial_message returns a session_id, but if the
+        MCP server restarts and the durable row was never created (initial
+        prompt was submitted against live_id, not durable_id), a subsequent
+        send_prompt must still work via the 4007 fallback."""
+        call_count = {"n": 0}
+
+        class FourOhSevenTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(200, json={"status": "ok"})
+                if "/messages" in path:
+                    call_count["n"] += 1
+                    if call_count["n"] == 1:
+                        return httpx.Response(200, json={"messages": []})
+                    return httpx.Response(200, json={"messages": [
+                        {"id": "u1", "role": "user", "content": "follow up"},
+                        {"id": "a1", "role": "assistant", "content": "SURE"},
+                    ]})
+                if "/sessions" in path:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=FourOhSevenTransport(), timeout=5)
+
+        ws_frames = [
+            {"id": 1, "error": {"code": 4007, "message": "session not found"}},
+            {"id": 2, "result": {"status": "streaming"}},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
+            result = await backend.send_prompt("initial_msg_sess", "follow up", timeout=10)
+
+        assert result["response"] == "SURE"
+
+    async def test_draft_timeout_get_chat_recovers(self):
+        """After a draft times out on send_prompt, get_chat should still
+        find the session — the backend persisted it on first prompt.submit,
+        even if we didn't get the reply."""
+        import hermes_chat_delegator.server as mod
+
+        # Backend: session exists after the prompt was submitted
+        class PostSubmitTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
+                if "/health" in path:
+                    return httpx.Response(200, json={"status": "ok"})
+                if path.rstrip("/") == "/api/sessions/durable_draft":
+                    # Session IS persisted (backend saved it on prompt.submit)
+                    return httpx.Response(200, json={
+                        "id": "durable_draft", "title": "Draft",
+                        "model": "test", "message_count": 1,
+                    })
+                if "/api/sessions" in path:
+                    return httpx.Response(200, json={"sessions": []})
+                return httpx.Response(404, json={})
+
+        fresh_backend = GuiBackend("127.0.0.1", 22222)
+        fresh_backend._client = httpx.AsyncClient(transport=PostSubmitTransport(), timeout=5)
+        mod._backend = fresh_backend
+
+        # After the timeout, get_chat should find the session
+        info = await fresh_backend.get_session("durable_draft")
+        assert info["id"] == "durable_draft"
+        assert info["title"] == "Draft"
+
+
+@pytest.mark.asyncio
+class TestSessionAffinityDiscovery:
+    """Discovery must pick the backend that OWNS the session, not the one
+    that was merely active most recently.
+
+    Regression: this machine runs one backend per Hermes profile
+    (``hermes_cli.main --profile <name> serve``).  All of them are live, all
+    answer ``/api/sessions`` with 200, and all have recent activity, so the
+    recency ranking picked whichever profile happened to move last.  When
+    that was not the profile holding the caller's session, the session-404
+    recovery path re-ran the same ranking, re-selected the same wrong
+    backend, and returned a permanent ``session_not_found on re-discovered
+    backend`` while the real backend sat healthy on another port.
+    """
+
+    SID = "20260822_184745_cbe1a5"
+
+    def _netstat(self, *ports):
+        return "".join(
+            f"  TCP    127.0.0.1:{p}    0.0.0.0:0    LISTENING    {i}\n"
+            for i, p in enumerate(ports, start=100)
+        )
+
+    async def _discover(self, transport, *ports, **kw):
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)):
+            mock_run.return_value = MagicMock(stdout=self._netstat(*ports))
+            return await auto_discover_backend("127.0.0.1", **kw)
+
+    async def test_owner_beats_more_recent_nonowner(self):
+        """The owning backend wins even when another backend is far more
+        recently active.  Without session affinity this returns 9002."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            8001: {  # owns the session, but quiet for a day
+                f"/api/sessions/{self.SID}/messages": (200, {"messages": []}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": self.SID, "last_active": now - 86400},
+                ]}),
+            },
+            9002: {  # busy right now, but does not have the session
+                f"/api/sessions/{self.SID}/messages": (404, {"error": "not found"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "other", "last_active": now - 5},
+                ]}),
+            },
+        })
+        port = await self._discover(transport, 8001, 9002,
+                                    require_session_id=self.SID)
+        assert port == 8001, (
+            f"Expected 8001 (owns {self.SID}), got {port} — recency beat ownership"
+        )
+
+    async def test_unaimed_discovery_picks_the_wrong_one(self):
+        """Companion RED proof: the same topology without affinity selects the
+        recently-active non-owner.  This is the bug being fixed, pinned so the
+        affinity test above cannot silently pass for the wrong reason."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            8001: {"/api/sessions": (200, {"sessions": [
+                {"id": self.SID, "last_active": now - 86400}]})},
+            9002: {"/api/sessions": (200, {"sessions": [
+                {"id": "other", "last_active": now - 5}]})},
+        })
+        port = await self._discover(transport, 8001, 9002)
+        assert port == 9002
+
+    async def test_disowning_backend_is_excluded_not_merely_ranked(self):
+        """A backend that 404s the session is removed from consideration, so
+        it cannot win by being the only other candidate."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            9002: {
+                f"/api/sessions/{self.SID}/messages": (404, {"error": "not found"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "other", "last_active": now - 5},
+                ]}),
+            },
+        })
+        port = await self._discover(transport, 9002, require_session_id=self.SID)
+        assert port is None, f"Disowning backend should be excluded, got {port}"
+
+    async def test_inconclusive_answer_does_not_exclude(self):
+        """A 5xx on the ownership probe is not a denial — the candidate stays
+        eligible via the recency path so a transient hiccup cannot strand us."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            8001: {
+                f"/api/sessions/{self.SID}/messages": (503, {"error": "busy"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": self.SID, "last_active": now - 5},
+                ]}),
+            },
+        })
+        port = await self._discover(transport, 8001, require_session_id=self.SID)
+        assert port == 8001, f"5xx must not exclude the candidate, got {port}"
+
+    async def test_falls_back_to_unaimed_when_nobody_claims(self):
+        """If no backend claims the session (e.g. an unauthenticable profile,
+        or a draft with no messages endpoint yet), behaviour must degrade to
+        exactly what it was before affinity existed — never to a new failure."""
+        now = time.time()
+        transport = PortRoutingTransport({
+            9002: {
+                f"/api/sessions/{self.SID}/messages": (404, {"error": "not found"}),
+                "/api/sessions": (200, {"sessions": [
+                    {"id": "other", "last_active": now - 5},
+                ]}),
+            },
+        })
+        with patch("hermes_chat_delegator.server.subprocess.run") as mock_run, \
+             patch("hermes_chat_delegator.server.httpx.AsyncClient",
+                   side_effect=_patched_async_client(transport)), \
+             patch.dict(os.environ, {"HERMES_GUI_PORT": ""}, clear=False):
+            mock_run.return_value = MagicMock(stdout=self._netstat(9002))
+            server._backend = None
+            backend = await server._find_or_discover_backend(
+                require_session_id=self.SID
+            )
+        server._backend = None
+        assert backend is not None, "must fall back rather than return None"
+        assert backend.port == 9002

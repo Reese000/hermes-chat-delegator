@@ -22,7 +22,9 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field, asdict
 from functools import partial
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -33,6 +35,138 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: Persistent Draft Sessions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DraftSessionRecord:
+    """Persistent draft session metadata."""
+    session_id: str
+    live_session_id: str
+    created_at: float
+    title: Optional[str] = None
+
+
+class PersistentDraftSessions:
+    """Manage draft sessions with disk persistence.
+
+    Draft sessions (created without initial_message) must survive MCP server
+    restarts so agents can bootstrap them on the first send_prompt. Stored
+    in ~/.hermes/mcp_draft_sessions.json as JSON for easy inspection/recovery.
+
+    Thread-safe (via asyncio.Lock) but not process-safe. Reads/writes are
+    atomic via temp-file + rename.
+    """
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path or Path.home() / ".hermes" / "mcp_draft_sessions.json"
+        self._lock = asyncio.Lock()
+        self._cache: dict[str, DraftSessionRecord] = {}
+        self._load_sync()
+
+    def _load_sync(self) -> None:
+        """Load from disk at startup (synchronous, called from __init__)."""
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                self._cache = {
+                    k: DraftSessionRecord(**v) for k, v in data.items()
+                }
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(
+                    "Failed to load draft sessions from %s: %s — starting fresh",
+                    self.path, e,
+                )
+                self._cache = {}
+
+    async def get(self, session_id: str) -> Optional[DraftSessionRecord]:
+        """Get a draft session record."""
+        async with self._lock:
+            return self._cache.get(session_id)
+
+    async def add(self, record: DraftSessionRecord) -> None:
+        """Add and persist a draft session record."""
+        async with self._lock:
+            self._cache[record.session_id] = record
+            await self._save()
+
+    async def remove(self, session_id: str) -> None:
+        """Remove and persist a draft session record."""
+        async with self._lock:
+            self._cache.pop(session_id, None)
+            await self._save()
+
+    async def _save(self) -> None:
+        """Atomically persist cache to disk."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {k: asdict(v) for k, v in self._cache.items()}
+        temp_path = self.path.with_suffix(".tmp")
+        try:
+            temp_path.write_text(json.dumps(data, indent=2))
+            temp_path.replace(self.path)
+        except Exception as e:
+            logger.error("Failed to save draft sessions to %s: %s", self.path, e)
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: Metrics & Structured Logging
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetricsSnapshot:
+    """Point-in-time metrics snapshot."""
+    timestamp: float = field(default_factory=time.time)
+    sessions_created: int = 0
+    sessions_deleted: int = 0
+    prompts_sent: int = 0
+    prompts_succeeded: int = 0
+    prompts_timed_out: int = 0
+    bytes_sent: int = 0
+    bytes_received: int = 0
+    ws_reconnects: int = 0
+    ws_auth_failures: int = 0
+    http_errors: int = 0
+
+
+class MetricsCollector:
+    """Collect and report operational metrics.
+
+    Tracks request volumes, error rates, and latency. Snapshots are
+    point-in-time; metrics are reset on snapshot() call.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._counts = {
+            "sessions_created": 0,
+            "sessions_deleted": 0,
+            "prompts_sent": 0,
+            "prompts_succeeded": 0,
+            "prompts_timed_out": 0,
+            "bytes_sent": 0,
+            "bytes_received": 0,
+            "ws_reconnects": 0,
+            "ws_auth_failures": 0,
+            "http_errors": 0,
+        }
+
+    async def increment(self, metric: str, by: int = 1) -> None:
+        """Increment a metric counter."""
+        async with self._lock:
+            if metric in self._counts:
+                self._counts[metric] += by
+            else:
+                logger.warning("Unknown metric: %s", metric)
+
+    async def snapshot(self) -> MetricsSnapshot:
+        """Return current metrics and reset counters."""
+        async with self._lock:
+            snap = MetricsSnapshot(**self._counts)
+            self._counts = {k: 0 for k in self._counts}
+            return snap
 
 # The `websockets` client library defaults `max_size` to 2**20 (1,048,576
 # bytes) — any single incoming frame larger than that kills the connection
@@ -99,7 +233,193 @@ _TRANSIENT_HTTP_ERRORS = (
 )
 
 
+class WsAuthFailure(RuntimeError):
+    """The WebSocket upgrade was rejected for authentication reasons.
+
+    This is the single most common way the delegator "goes down" while
+    looking perfectly healthy, and it is worth stating precisely because the
+    symptom points away from the cause.
+
+    Both the backend port and its session token are *per-boot* values: the
+    desktop shell launches the backend with ``--port 0`` and
+    ``hermes_cli.web_server`` mints ``_SESSION_TOKEN`` with
+    ``secrets.token_urlsafe(32)`` on every start.  The delegator captures the
+    token once, at process start, and pins it into ``os.environ``.  After the
+    backend restarts, that pinned token is stale — and the two halves of the
+    API disagree about whether that matters:
+
+      * ``/api/sessions`` on a headless ``hermes serve`` backend is
+        **unauthenticated**, so it returns 200 for a stale token exactly as
+        it would for a valid one.  ``auto_discover_backend`` therefore
+        confirms the backend, and ``backend_status`` reports
+        ``connected: true``.
+      * ``/api/ws`` **does** validate, and rejects a stale token with 403.
+
+    Verified directly against the live backend: no token -> connects;
+    bogus token -> ``HTTP 403``.  So a stale token is strictly worse than no
+    token at all, which is why the recovery path below drops it.
+    """
+
+    def __init__(self, port: int, status: Optional[int], detail: str = ""):
+        self.port = port
+        self.status = status
+        self.detail = detail
+        super().__init__(
+            f"WebSocket upgrade to Hermes backend on port {port} was rejected "
+            f"(HTTP {status if status is not None else '?'}) after re-discovering "
+            "the session token and retrying without one. The backend is "
+            "answering REST, so this is an auth/token problem, not an outage. "
+            "If it persists, restart Hermes so a fresh token is minted."
+            + (f" [{detail}]" if detail else "")
+        )
+
+
+class BackendAmbiguous(RuntimeError):
+    """Multiple live backend instances detected with indistinguishable recency.
+
+    This is NOT an outage — Hermes is running, but we cannot determine
+    which instance is the "live" one.  The caller must NOT silently pick
+    one, because a wrong choice invites destructive recovery against
+    healthy work.
+
+    ``ports`` lists the candidate ports so the user can shut down the
+    extras.
+    """
+
+    def __init__(self, ports: list[int]):
+        self.ports = sorted(ports)
+        super().__init__(
+            f"Multiple Hermes backend instances detected on ports "
+            f"{', '.join(str(p) for p in self.ports)} with indistinguishable "
+            "recency. Cannot determine which is live. Shut down the extra "
+            "instance(s) and retry."
+        )
+
+
+# Upgrade rejections that indicate an auth problem rather than a transient
+# transport blip. These are the ones worth re-discovering a token for.
+_WS_AUTH_STATUSES = (401, 403)
+
+
+def _ws_status_of(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status from a websockets upgrade failure.
+
+    The `websockets` library has moved this attribute across versions
+    (``InvalidStatusCode.status_code`` in <=11, ``InvalidStatus.response.status_code``
+    in >=12), so probe both shapes and fall back to scraping the message
+    rather than raising a different error while trying to describe this one.
+    """
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if isinstance(status, int):
+        return status
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    m = re.search(r"HTTP (\d{3})", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _ws_url_for(backend: "GuiBackend", token: Optional[str]) -> str:
+    """Build the /api/ws URL using an explicit token (or none)."""
+    base = f"ws://{backend.host}:{backend.port}/api/ws"
+    if token:
+        base += "?" + urlencode({"token": token})
+    return base
+
+
+def _ws_connect(backend: "GuiBackend"):
+    """``websockets.connect`` for a backend, with token self-healing.
+
+    On an auth rejection this does what a human operator would do, in order,
+    without needing the MCP client process to be restarted:
+
+      1. Re-discover the session token from the live backend process and
+         retry.  This repairs the common case — the backend restarted and
+         minted a new token — which previously required restarting Claude
+         Code itself, because nothing in-process ever refreshed the value.
+      2. Failing that, retry with **no** token at all.  A stale token is
+         actively rejected while an absent one is simply not checked on
+         backends that do not require auth, so dropping it strictly widens
+         the set of backends we can talk to.
+      3. Only if all three attempts fail, raise :class:`WsAuthFailure`,
+         which the handler layer reports as retryable and which resets the
+         cached backend so the next call re-discovers from scratch.
+
+    A successful repair is written back onto the backend object, so the very
+    next WS call goes straight through instead of paying for discovery again.
+    """
+
+    class _Ctx:
+        async def __aenter__(self):
+            attempts: list[Optional[str]] = [backend.token]
+
+            last_exc: Optional[BaseException] = None
+            last_status: Optional[int] = None
+            tried_refresh = False
+
+            while attempts:
+                token = attempts.pop(0)
+                try:
+                    self._cm = websockets.connect(
+                        _ws_url_for(backend, token), max_size=_WS_MAX_SIZE
+                    )
+                    conn = await self._cm.__aenter__()
+                    if token != backend.token:
+                        # Persist the repair for subsequent calls.
+                        logger.info(
+                            "WS auth repaired for %s:%s (token %s)",
+                            backend.host, backend.port,
+                            "refreshed" if token else "dropped",
+                        )
+                        backend.token = token or ""
+                    return conn
+                except Exception as exc:
+                    status = _ws_status_of(exc)
+                    if status not in _WS_AUTH_STATUSES:
+                        raise
+                    last_exc, last_status = exc, status
+
+                    if not tried_refresh:
+                        tried_refresh = True
+                        try:
+                            from .token_discovery import refresh_session_token
+
+                            fresh = refresh_session_token()
+                        except Exception:
+                            fresh = None
+                        # Only worth another round-trip if it differs from
+                        # what we just proved does not work.
+                        if fresh and fresh != token:
+                            attempts.append(fresh)
+                        attempts.append(None)  # tokenless last resort
+
+            raise WsAuthFailure(
+                backend.port, last_status,
+                type(last_exc).__name__ if last_exc else "",
+            ) from last_exc
+
+        async def __aexit__(self, *exc_info):
+            return await self._cm.__aexit__(*exc_info)
+
+    return _Ctx()
+
+
 class GuiBackend:
+    """Client for the Hermes GUI backend.
+
+    Manages multiple concurrent chat sessions via HTTP REST (reads/deletes)
+    and WebSocket JSON-RPC (sends). Automatically discovers the backend
+    port via netstat scanning and recovers from token staleness on restarts.
+
+    Features:
+      - Persistent draft session storage (survives MCP server restarts)
+      - Connection pooling for HTTP requests
+      - Metrics collection for monitoring and debugging
+      - Structured error logging with recovery hints
+      - Event-based prompt streaming (keep WebSocket open)
+    """
+
     def __init__(self, host: str, port: int, token: str = ""):
         self.host = host
         self.port = port
@@ -108,12 +428,25 @@ class GuiBackend:
             timeout=httpx.Timeout(connect=5, read=15, write=5, pool=5),
             headers=self._auth_headers(),
         )
+        # Persistent draft sessions — survive MCP server restarts
+        self._draft_sessions = PersistentDraftSessions()
+        # Metrics collection for observability
+        self._metrics = MetricsCollector()
 
     def _auth_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
         if self.token:
             headers[_SESSION_HEADER_NAME] = self.token
         return headers
+
+    def _refresh_client_headers(self) -> None:
+        """Rebuild the HTTP client's default headers from the current token.
+
+        Called after a token refresh so REST calls immediately use the new
+        credential without recreating the entire client (which would drop
+        the connection pool).
+        """
+        self._client.headers.update(self._auth_headers())
 
     @property
     def base_url(self) -> str:
@@ -167,6 +500,35 @@ class GuiBackend:
     async def health(self) -> dict:
         r = await self._request("GET", f"{self.base_url}/health")
         return r.json()
+
+    async def is_alive(self) -> bool:
+        """Authenticated liveness probe — the ONLY reliable check.
+
+        Probes ``/api/sessions`` with the backend's own token.  Returns
+        True only if the response is HTTP 200 with a ``"sessions"`` key.
+
+        This answers three questions in one request:
+          1. Is something listening on this port?
+          2. Is it a Hermes backend (not Foundry Manager, etc.)?
+          3. Does our token authenticate against *this* instance?
+
+        ``/health`` cannot do this: some Hermes instances (e.g. headless
+        ``hermes serve``) do not expose ``/health`` at all, while unrelated
+        services can expose Hermes-shaped ``/health`` banners.  The
+        authenticated operation itself is the only probe that cannot be
+        fooled by an unimplemented or over-implemented endpoint.
+        """
+        try:
+            r = await self._request(
+                "GET", f"{self.base_url}/api/sessions",
+                params={"limit": 1, "min_messages": 0, "order": "recent"},
+            )
+            if r.status_code != 200:
+                return False
+            body = r.json()
+            return isinstance(body, dict) and "sessions" in body
+        except Exception:
+            return False
 
     async def list_sessions(self, limit: int = 50) -> list[dict]:
         r = await self._request(
@@ -307,8 +669,12 @@ class GuiBackend:
         session has no durable row yet (Hermes persists it on first prompt),
         so session.resume-by-durable-id 404s (backend error 4007) until
         after that first submit has happened.
+
+        After sending the prompt, briefly waits for at least one event from the
+        backend to keep the session alive. Closing the WS immediately after send
+        causes the backend to reap the session as orphaned before the agent starts.
         """
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+        async with _ws_connect(self) as ws:
             params: dict = {}
             if title:
                 params["title"] = title
@@ -335,6 +701,13 @@ class GuiBackend:
                     "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
                     "params": {"session_id": created["live_session_id"], "text": initial_message},
                 }))
+                # Keep the connection open briefly so the backend doesn't reap the
+                # session as orphaned. Read for up to 500ms to wait for the agent
+                # to acknowledge and start processing (at least one event).
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=0.5)
+                except (asyncio.TimeoutError, Exception):
+                    pass  # Connection closing is fine; we're just keeping it alive briefly
 
         if initial_message:
             reply = await self._poll_for_reply(
@@ -343,13 +716,25 @@ class GuiBackend:
             created["initial_response"] = reply["response"]
             if reply.get("timed_out"):
                 created["initial_response_timed_out"] = True
+            await self._metrics.increment("sessions_created")
+        else:
+            # Register as draft: send_prompt will bootstrap the durable row.
+            # Persist to disk so it survives MCP server restarts.
+            record = DraftSessionRecord(
+                session_id=created["session_id"],
+                live_session_id=created["live_session_id"],
+                created_at=time.time(),
+                title=created.get("title"),
+            )
+            await self._draft_sessions.add(record)
+            await self._metrics.increment("sessions_created")
 
         return created
 
     async def branch_session(self, session_id: str, title: str = "",
                              timeout: float = 15) -> dict:
         """Branch an existing session, copying its full history."""
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+        async with _ws_connect(self) as ws:
             # Resume the source session to get a live id
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
@@ -405,7 +790,7 @@ class GuiBackend:
         then retries — the gateway's ``_mirror_slash_side_effects`` refuses
         to mutate a running session.
         """
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+        async with _ws_connect(self) as ws:
             # Resume to get a live session id
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
@@ -475,7 +860,7 @@ class GuiBackend:
     async def _interrupt_and_switch(self, session_id: str, model: str,
                                     timeout: float = 15) -> dict:
         """Interrupt a busy session then retry the model switch."""
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
+        async with _ws_connect(self) as ws:
             # Resume
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.resume",
@@ -531,58 +916,63 @@ class GuiBackend:
 
     async def send_prompt(self, session_id: str, message: str,
                           timeout: float = 300) -> dict:
-        """Send a prompt via WebSocket. Returns when agent finishes or timeout."""
-        # Get the last assistant message id BEFORE submitting. A brand-new
-        # draft session (from create_session with no prior prompt) has no
-        # durable row yet, so the messages endpoint 404s — that just means
-        # there's no prior baseline, not a real error.
-        try:
-            before_msgs = await self.get_messages(session_id, last_n=5)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                before_msgs = []
-            else:
-                raise
-        last_assistant_id = None
-        for m in reversed(before_msgs):
-            if m.get("role") == "assistant":
-                last_assistant_id = m.get("id")
+        """Send a prompt via WebSocket. Returns when agent finishes or timeout.
+
+        For draft sessions (created without initial_message), submits the
+        first prompt against the live session id to bootstrap the durable
+        row, then cleans up the draft mapping.
+
+        Internally uses the streaming approach to keep the WebSocket alive
+        during message polling. Closing the WS immediately after send causes
+        the backend to reap the session as orphaned before the agent starts.
+        """
+        # Use send_prompt_stream internally to keep WS alive throughout polling,
+        # then return just the final response in send_prompt's traditional format.
+        final_result = None
+        async for etype, payload in self.send_prompt_stream(session_id, message, timeout=timeout):
+            if etype == "__done__":
+                final_result = payload
                 break
 
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
-            # Resume
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
-                "params": {"session_id": session_id},
-            }))
-            resp = await _recv_response(ws, 1, timeout=15)
-            if "error" in resp:
-                raise RuntimeError("resume failed: " + str(resp.get("error", "unknown")))
-            live_id = resp["result"].get("session_id", session_id)
+        if final_result is None:
+            # Should never happen but handle gracefully
+            await self._metrics.increment("prompts_timed_out")
+            return {
+                "response": None,
+                "session_id": session_id,
+                "timed_out": True,
+                "status": "error",
+            }
 
-            # Submit
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
-                "params": {"session_id": live_id, "text": message},
-            }))
+        # Track success metrics
+        await self._metrics.increment("prompts_sent")
+        if not final_result.get("timed_out"):
+            await self._metrics.increment("prompts_succeeded")
 
-        # Poll via REST (durable id only — the live id 404s here, confirmed
-        # live: 404 on live id, 200 on durable id for the same session).
-        return await self._poll_for_reply(session_id, last_assistant_id, timeout)
+        return final_result
 
     async def send_prompt_stream(self, session_id: str, message: str,
                                  timeout: float = 300):
-        """Yields (event_type, payload) tuples; last yield is ('__done__', final_dict)."""
-        async with websockets.connect(self.ws_url, max_size=_WS_MAX_SIZE) as ws:
-            # Resume
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
-                "params": {"session_id": session_id},
-            }))
-            resp = await _recv_response(ws, 1, timeout=15)
-            if "error" in resp:
-                raise RuntimeError(f"resume failed: {resp['error']}")
-            live_id = resp["result"].get("session_id", session_id)
+        """Yields (event_type, payload) tuples; last yield is ('__done__', final_dict).
+
+        For draft sessions, submits against the live id directly (same as
+        send_prompt's draft path). Removes the draft record after first prompt.
+        """
+        draft_record = await self._draft_sessions.get(session_id)
+
+        async with _ws_connect(self) as ws:
+            if draft_record:
+                live_id = draft_record.live_session_id
+            else:
+                # Resume
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                    "params": {"session_id": session_id},
+                }))
+                resp = await _recv_response(ws, 1, timeout=15)
+                if "error" in resp:
+                    raise RuntimeError(f"resume failed: {resp['error']}")
+                live_id = resp["result"].get("session_id", session_id)
 
             # Submit
             await ws.send(json.dumps({
@@ -613,6 +1003,9 @@ class GuiBackend:
                         payload.get("delta") or payload.get("text") or ""
                     )
                 if etype == "message.complete":
+                    # Clean up draft record if this was a draft session
+                    if draft_record:
+                        await self._draft_sessions.remove(session_id)
                     content = payload.get("content", "")
                     yield ("__done__", {
                         "response": "".join(final_text_parts) or content,
@@ -623,6 +1016,8 @@ class GuiBackend:
                     raise RuntimeError(f"agent error mid-turn: {payload}")
 
             # Timed out
+            if draft_record:
+                await self._draft_sessions.remove(session_id)
             yield ("__done__", {
                 "response": "".join(final_text_parts),
                 "session_id": session_id,
@@ -644,8 +1039,28 @@ def _safe_epoch(v) -> float:
         return 0.0
 
 
-async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
-    """Find the Hermes GUI backend by probing localhost ports concurrently."""
+async def auto_discover_backend(
+    host: str = "127.0.0.1",
+    require_session_id: Optional[str] = None,
+) -> Optional[int]:
+    """Find the Hermes GUI backend by probing localhost ports concurrently.
+
+    ``require_session_id`` turns discovery from a heuristic into a decision
+    procedure.  The recency-based ranking below assumes one live backend plus
+    some stale ones; that assumption is false on a machine running a backend
+    per Hermes *profile* (``hermes_cli.main --profile <name> serve``), because
+    every one of them is genuinely live, answers ``/api/sessions`` with 200,
+    and has recent activity.  Ranking those by recency picks whichever profile
+    happened to move last, which has nothing to do with which backend owns the
+    session the caller actually asked for — the observed failure being a
+    permanent ``session_not_found on re-discovered backend`` while the real
+    backend sat healthy on another port.
+
+    When the caller knows the session id, ownership is directly testable, so
+    we test it instead of guessing: a backend that serves the session scores
+    above every recency match, and one that explicitly disowns it (404) is
+    removed from consideration entirely rather than left to win a tiebreak.
+    """
     try:
         result = subprocess.run(
             ["netstat", "-ano"], capture_output=True, text=True, timeout=5,
@@ -664,14 +1079,21 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
 
     session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
 
-    async def _probe(port: int) -> tuple[int, int] | None:
-        """Returns (port, strength) — 2 for a confirmed usable backend
-        (``/api/sessions`` actually answers with our auth, if any), 1 for a
-        same-process heuristic match we can't confirm we can talk to.
+    async def _probe(port: int, session_token: str) -> tuple[int, int, float] | None:
+        """Returns (port, strength, recency) — strength 3 for a backend that
+        demonstrably owns ``require_session_id``, 2 for a confirmed usable
+        backend (``/api/sessions`` actually answers with our auth), 1 for a
+        same-process heuristic match.
+
+        ``recency`` is the ``last_active`` epoch of the most recent session
+        on this instance (0 if no sessions).  This is the primary
+        discriminator when two instances both score strength 2: the live
+        instance has recent activity; a stale one does not.
+
         Distinct Hermes components can share a host: e.g. the messaging
         gateway's OpenAI-compatible API server also serves a Hermes-shaped
         ``/health`` (including a ``version`` key) but gates ``/api/sessions``
-        behind ``Authorization: Bearer <API_SERVER_KEY>`` — a scheme this
+        behind ``Authorization: Bearer <API_S...Y>`` — a scheme this
         client never sends. Matching on ``/health`` alone previously locked
         onto that gateway instead of the actual dashboard backend, and every
         session/chat call then 401'd with no way to recover short of manually
@@ -682,11 +1104,45 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
                 headers = {}
                 if session_token:
                     headers[_SESSION_HEADER_NAME] = session_token
-                r2 = await c.get(f"http://{host}:{port}/api/sessions", headers=headers)
+                r2 = await c.get(
+                    f"http://{host}:{port}/api/sessions",
+                    headers=headers,
+                    params={"limit": 1, "min_messages": 0, "order": "recent"},
+                )
                 if r2.status_code == 200:
                     body2 = r2.json()
                     if isinstance(body2, dict) and "sessions" in body2:
-                        return (port, 2)
+                        sessions = body2["sessions"]
+                        recency = _safe_epoch(
+                            sessions[0].get("last_active") if sessions else None
+                        )
+                        if not require_session_id:
+                            return (port, 2, recency)
+
+                        # Ownership is decidable, so decide it.  A 200 means
+                        # this backend holds the session; a 404 means it
+                        # provably does not, which is stronger information
+                        # than any recency signal and must exclude the
+                        # candidate rather than merely rank it lower.
+                        # Anything else (5xx, timeout, malformed) is an
+                        # inconclusive answer, not a denial: fall back to the
+                        # recency ranking so an unrelated backend hiccup can
+                        # never strand a caller that would otherwise have
+                        # found its session.
+                        try:
+                            r3 = await c.get(
+                                f"http://{host}:{port}"
+                                f"/api/sessions/{require_session_id}/messages",
+                                headers=headers,
+                                params={"limit": 1},
+                            )
+                        except Exception:
+                            return (port, 2, recency)
+                        if r3.status_code == 200:
+                            return (port, 3, recency)
+                        if r3.status_code == 404:
+                            return None
+                        return (port, 2, recency)
                 if r2.status_code == 401:
                     # Right shape, wrong/missing credential for this port —
                     # never treat as usable, even as a fallback.
@@ -696,20 +1152,119 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
                 if r.status_code == 200:
                     body = r.json()
                     if any(k in body for k in ("version", "service", "hermes")):
-                        return (port, 1)
+                        return (port, 1, 0.0)
         except Exception:
             pass
         return None
 
-    # Probe all candidate ports concurrently, then prefer a confirmed
-    # (/api/sessions-verified) match over a /health-only heuristic one;
-    # break ties by lowest port for determinism.
-    results = await asyncio.gather(*[_probe(p) for p in sorted(ports)])
-    found = [r for r in results if r is not None]
-    if not found:
+    async def _sweep(token: str) -> Optional[int]:
+        """Probe all candidate ports concurrently and pick the best match.
+
+        Prefers a confirmed (``/api/sessions``-verified) match over a
+        ``/health``-only heuristic one.  Among confirmed matches, prefers
+        the most recently active instance (highest ``last_active`` epoch),
+        which distinguishes the live backend from a stale one that also
+        answers ``/api/sessions`` with 200.
+
+        When two confirmed instances have indistinguishable recency (within
+        60 seconds), that is a genuine ambiguity — report it rather than
+        silently picking one, because a wrong choice invites destructive
+        recovery against healthy work.
+        """
+        results = await asyncio.gather(
+            *[_probe(p, token) for p in sorted(ports)]
+        )
+        found = [r for r in results if r is not None]
+        if not found:
+            return None
+
+        # Sort: highest strength first, then most recent activity, then
+        # lowest port as final tiebreaker (deterministic, not identity).
+        found.sort(key=lambda pr: (-pr[1], -pr[2], pr[0]))
+
+        best = found[0]
+
+        # A backend that owns the requested session is not ambiguous with
+        # backends that merely answer /api/sessions, however recently they
+        # were active — ownership was measured, not inferred.  Only a second
+        # backend claiming the *same* session id is a real conflict, and that
+        # is what the check below is narrowed to in that case.
+        owners = [r for r in found if r[1] == 3]
+        if owners:
+            if len(owners) == 1:
+                return owners[0][0]
+            logger.warning(
+                "Ambiguous session ownership: %d backends claim session %s "
+                "(ports %s).",
+                len(owners), require_session_id,
+                ", ".join(str(r[0]) for r in sorted(owners)),
+            )
+            raise BackendAmbiguous([r[0] for r in owners])
+
+        # Ambiguity detection: if there are multiple strength-2 candidates
+        # with similar recency, we cannot tell which is the live instance.
+        # Report this rather than silently picking one.
+        strength2 = [r for r in found if r[1] == 2]
+        if len(strength2) >= 2:
+            top_recency = strength2[0][2]
+            runners_up = [
+                r for r in strength2[1:]
+                if r[2] > 0 and abs(r[2] - top_recency) < 60
+            ]
+            if runners_up:
+                ambiguous_ports = [best[0]] + [r[0] for r in runners_up]
+                logger.warning(
+                    "Ambiguous backend discovery: %d instances with "
+                    "indistinguishable recency (ports %s). "
+                    "Cannot determine which is live.",
+                    len(ambiguous_ports),
+                    ", ".join(str(p) for p in sorted(ambiguous_ports)),
+                )
+                raise BackendAmbiguous(ambiguous_ports)
+
+        return best[0]
+
+    port = await _sweep(session_token)
+    if port is not None:
+        return port
+
+    # Nothing answered. The dominant cause is a STALE TOKEN, not a dead
+    # backend: this machine routinely runs more than one
+    # ``hermes_cli.main serve`` process (a desktop-shell backend on
+    # ``--port 0`` plus a pinned one on 8765), each minting its own
+    # ``secrets.token_urlsafe(32)`` at start and rejecting the other's with
+    # 401. Whichever token was captured at import is therefore correct only
+    # until the process it came from exits — after which _probe's
+    # "401 means never usable" rule (correct in itself) turns every
+    # candidate into None and discovery reports the same message as a
+    # genuinely absent Hermes.
+    #
+    # Re-reading the token from the live processes is the only thing that
+    # distinguishes those two states, and it is exactly what
+    # ``refresh_session_token`` exists for. Without this retry the failure is
+    # unrecoverable in-process: nothing else invalidates the pinned token, so
+    # every later call fails identically until the MCP client is restarted,
+    # and restarting Hermes cannot help because the stale value lives here.
+    try:
+        from .token_discovery import refresh_session_token
+    except Exception:
+        logger.warning("Token refresh unavailable; cannot retry discovery")
         return None
-    found.sort(key=lambda pr: (-pr[1], pr[0]))
-    return found[0][0]
+
+    try:
+        fresh = await asyncio.to_thread(refresh_session_token)
+    except Exception as exc:
+        logger.warning("Token refresh failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+    if not fresh or fresh == session_token:
+        # Either discovery could not run, or it returned what we already
+        # tried. Re-probing would be identical work for an identical result.
+        logger.info("No fresh session token available; backend not found")
+        return None
+
+    logger.info("Retrying backend discovery with a refreshed session token")
+    return await _sweep(fresh)
 
 
 # ---------------------------------------------------------------------------
@@ -719,32 +1274,160 @@ async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
 _backend: Optional[GuiBackend] = None
 
 
+async def _port_answers(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Liveness probe for a pinned port with Hermes identity verification.
+
+    Returns True only if the port answers ``/api/sessions`` with HTTP 200
+    AND the response body contains a ``"sessions"`` key — the shape that
+    Hermes uniquely exposes.  This prevents adopting a non-Hermes service
+    (e.g. Foundry Manager on port 3000) that happens to answer HTTP on
+    the same path.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(f"http://{host}:{port}/api/sessions")
+            if r.status_code != 200:
+                return False
+            body = r.json()
+            return isinstance(body, dict) and "sessions" in body
+    except Exception:
+        return False
+
+
 async def _require_backend() -> GuiBackend:
-    """Get the backend, lazily discovering if needed."""
+    """Get the backend, lazily discovering if needed.
+
+    If a cached backend exists but is unreachable, attempts a fresh
+    discovery before raising — a backend restart (new port) is the
+    dominant cause of "Not connected" errors.
+    """
     global _backend
-    if _backend is None:
-        host = os.environ.get("HERMES_GUI_HOST", "127.0.0.1")
-        port_str = os.environ.get("HERMES_GUI_PORT", "")
-        if port_str:
-            port = int(port_str)
+    if _backend is not None:
+        # Verify cached backend can actually serve requests before trusting it.
+        # Uses the authenticated /api/sessions probe — NOT /health, which can
+        # be absent on working backends (59681-style) or perfect on useless
+        # ones (8642-style with wrong token).  See TestHeadlessHealthBody.
+        try:
+            if await _backend.is_alive():
+                return _backend
+        except Exception:
+            logger.info("Cached backend %s:%s unreachable — re-discovering",
+                        _backend.host, _backend.port)
+            _backend = None
+
+    host = os.environ.get("HERMES_GUI_HOST", "127.0.0.1")
+    port_str = os.environ.get("HERMES_GUI_PORT", "")
+    port = None
+    if port_str:
+        try:
+            candidate = int(port_str)
+        except ValueError:
+            logger.warning("Ignoring non-integer HERMES_GUI_PORT=%r", port_str)
         else:
-            logger.info("Auto-discovering GUI backend...")
-            port = await auto_discover_backend(host)
-            if port is None:
-                raise RuntimeError(
-                    "Not connected to GUI backend — is Hermes running? "
-                    "Set HERMES_GUI_PORT to connect manually."
+            if await _port_answers(host, candidate):
+                port = candidate
+            else:
+                logger.warning(
+                    "HERMES_GUI_PORT=%s is not answering — falling back to "
+                    "auto-discovery", candidate,
                 )
-        token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
-        _backend = GuiBackend(host, port, token=token)
-        logger.info("Connected to backend on %s:%s", host, port)
+    if port is None:
+        logger.info("Auto-discovering GUI backend...")
+        try:
+            port = await auto_discover_backend(host)
+        except BackendAmbiguous as e:
+            # Multiple live instances — surface the ambiguity to the caller
+            # rather than silently picking one.  A wrong choice invites
+            # destructive recovery against healthy work.
+            raise RuntimeError(
+                str(e)
+            ) from e
+        if port is None:
+            raise RuntimeError(
+                "Not connected to GUI backend — is Hermes running? "
+                "Set HERMES_GUI_PORT to connect manually."
+            )
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    _backend = GuiBackend(host, port, token=token)
+    logger.info("Connected to backend on %s:%s", host, port)
     return _backend
+
+
+async def _find_or_discover_backend(
+    require_session_id: Optional[str] = None,
+) -> Optional[GuiBackend]:
+    """Discover or find a live backend without raising.
+
+    Returns a GuiBackend if reachable, None if genuinely down.
+    Unlike ``_require_backend``, never raises — callers use this
+    to retry after a connection failure.
+
+    ``require_session_id`` restricts discovery to the backend that owns that
+    session.  It also suppresses the pinned-port shortcut below: when we are
+    recovering from a session 404, the pinned port is precisely the backend
+    that just disowned the session, so accepting it because it "answers"
+    would re-select the known-wrong instance and make the retry a no-op.
+    """
+    global _backend
+    host = os.environ.get("HERMES_GUI_HOST", "127.0.0.1")
+
+    # Try the currently pinned port first
+    port_str = os.environ.get("HERMES_GUI_PORT", "")
+    if port_str and not require_session_id:
+        try:
+            candidate = int(port_str)
+            if await _port_answers(host, candidate):
+                token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+                _backend = GuiBackend(host, candidate, token=token)
+                logger.info("Re-discovered backend on pinned port %s", candidate)
+                return _backend
+        except ValueError:
+            pass
+
+    # Full discovery
+    port = await auto_discover_backend(host, require_session_id=require_session_id)
+    if port is None and require_session_id:
+        # No backend claimed the session.  That is not proof the session is
+        # gone: a backend we cannot authenticate to (each Hermes profile
+        # mints its own token) drops out of the aimed sweep on 401, and a
+        # freshly-created draft may not expose a messages endpoint yet.
+        # Affinity is therefore a preference that decides the outcome when it
+        # fires, never a new way to fail — fall back to the unaimed sweep so
+        # this path is strictly no worse than it was before affinity existed.
+        logger.info(
+            "No backend claimed session %s — falling back to unaimed discovery",
+            require_session_id,
+        )
+        port = await auto_discover_backend(host)
+    if port is None:
+        return None
+
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    _backend = GuiBackend(host, port, token=token)
+    logger.info("Re-discovered backend on auto-discovered port %s", port)
+    return _backend
+
+
+async def _reconnect_backend(
+    require_session_id: Optional[str] = None,
+) -> GuiBackend:
+    """Re-discover and replace the cached backend, or raise RuntimeError."""
+    b = await _find_or_discover_backend(require_session_id=require_session_id)
+    if b is None:
+        raise RuntimeError(
+            "Backend is unreachable after re-discovery — is Hermes running? "
+            "Set HERMES_GUI_PORT to connect manually."
+        )
+    return b
 
 
 def _reset_backend():
     """Mark backend as disconnected so next call re-discovers."""
     global _backend
     _backend = None
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -828,17 +1511,19 @@ TOOLS: list[Tool] = [
         name="create_chat",
         description=(
             "Create a new chat session in the Hermes GUI. Returns immediately "
-            "with the new session's IDs. IMPORTANT: the new session is NOT yet "
-            "visible to list_chats/get_chat/get_messages until a message has "
-            "actually been sent in it — Hermes only persists the session row on "
-            "first prompt. Pass initial_message to send a first prompt "
-            "immediately and get a session that's fully visible right away; "
-            "omit it to create an empty draft session (matches what the GUI "
-            "does when you click 'New chat'). Note: a bad model name will "
-            "surface as an error on the first send_prompt, not on create_chat. "
-            "Note: if initial_message is provided and a human has this session's "
-            "GUI tab open, using this tool will freeze that tab's live view until "
-            "they reopen/refocus it (known backend limitation, not a bug in this server)."
+            "with the new session's IDs. "
+            "If initial_message is provided, the prompt is sent immediately, "
+            "the agent's reply is returned, and the session is fully visible "
+            "to all other tools right away. "
+            "If omitted, an empty draft session is created that is NOT yet "
+            "visible to list_chats/get_chat — but the first send_prompt "
+            "against it will automatically bootstrap the durable row "
+            "(no error). A bad model name will surface on the first "
+            "send_prompt, not on create_chat. "
+            "Note: if initial_message is provided and a human has this "
+            "session's GUI tab open, using this tool will freeze that tab's "
+            "live view until they reopen/refocus it (known backend limitation, "
+            "not a bug in this server)."
         ),
         inputSchema={"type": "object", "properties": {
             "title": {"type": "string", "description": "Optional title. Untitled if omitted."},
@@ -935,6 +1620,15 @@ TOOLS: list[Tool] = [
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
+    Tool(
+        name="get_metrics",
+        description=(
+            "Get operational metrics (sessions, prompts, errors, reconnects). "
+            "Metrics are cumulative since the last snapshot and reset after "
+            "this call. Use to monitor MCP server health and performance."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
 ]
 
 
@@ -948,6 +1642,98 @@ def _text(text: str) -> list[TextContent]:
 
 def _err(code: str, msg: str, retryable: bool = False) -> list[TextContent]:
     return _text(json.dumps({"error": {"code": code, "message": msg, "retryable": retryable}}))
+
+
+async def _retry_handler(fn, *args, **kwargs):
+    """Execute a handler, re-discovering the backend on connection/auth failure.
+
+    Pattern: call the handler. If it fails with ConnectError (backend
+    restarted to new port), WsAuthFailure (stale token), or a session-
+    scoped 404 (split instance — the backend is reachable but doesn't own
+    the session we asked about), re-discover the backend and retry ONCE.
+    If the retry also fails, return the error from the retry (which has
+    more diagnostic information).
+
+    BackendAmbiguous is never retried — it means multiple live instances
+    exist and we cannot tell which is the real one.  Surfacing the
+    candidate ports lets the user shut down the extras.
+
+    This replaces the per-handler ``except httpx.ConnectError: _reset_backend()``
+    pattern with a centralized retry that actually re-discovers instead of
+    just clearing the cache and hoping the next call will discover.
+    """
+    try:
+        return await fn(*args, **kwargs)
+    except BackendAmbiguous as e:
+        # Never retry — multiple live instances is not transient.
+        _reset_backend()
+        return _err("ambiguous_backend", str(e), retryable=False)
+    except (httpx.ConnectError, WsAuthFailure) as first_exc:
+        # Re-discover: find the backend at its current port with a fresh token
+        logger.info("Connection failed (%s) — re-discovering backend",
+                     type(first_exc).__name__)
+        try:
+            await _reconnect_backend()
+        except RuntimeError:
+            # Backend genuinely unreachable after re-discovery
+            _reset_backend()
+            if isinstance(first_exc, WsAuthFailure):
+                return _err("ws_auth_failed", str(first_exc), retryable=True)
+            return _err("not_connected",
+                        "Backend unreachable after re-discovery — is Hermes running?",
+                        retryable=True)
+
+        # Retry the operation with the newly discovered backend
+        try:
+            return await fn(*args, **kwargs)
+        except BackendAmbiguous as e:
+            _reset_backend()
+            return _err("ambiguous_backend", str(e), retryable=False)
+        except WsAuthFailure as second_exc:
+            _reset_backend()
+            return _err("ws_auth_failed", str(second_exc), retryable=True)
+        except httpx.ConnectError:
+            _reset_backend()
+            return _err("not_connected",
+                        "Backend unreachable after re-discovery — is Hermes running?",
+                        retryable=True)
+        except Exception as e:
+            return _err("backend_error", f"Failed after re-discovery: {e}")
+    except httpx.HTTPStatusError as first_exc:
+        # A 404 on a session-scoped endpoint is self-contradictory when the
+        # session was recently visible (e.g. list_chats just returned it).
+        # This is the signature of a split instance: the cached backend is
+        # reachable but doesn't own the session.  Re-discover and retry once.
+        if first_exc.response.status_code != 404:
+            raise
+        # The session id is in the URL that just 404'd, so the retry can be
+        # aimed rather than repeated.  Without this the re-discovery re-runs
+        # the same recency ranking, re-selects the same backend that just
+        # disowned the session, and the "retry once" path reliably returns
+        # the identical 404 it was written to recover from.
+        _sid_m = re.search(r"/api/sessions/([^/?#]+)", str(first_exc.request.url))
+        _sid = _sid_m.group(1) if _sid_m else None
+        logger.info("Session 404 on %s — re-discovering backend that owns %s",
+                     first_exc.request.url, _sid or "(unknown session)")
+        try:
+            await _reconnect_backend(require_session_id=_sid)
+        except RuntimeError:
+            _reset_backend()
+            return _err("session_not_found",
+                        f"Session not found on any reachable backend "
+                        f"(first attempt 404 on {first_exc.request.url})",
+                        retryable=True)
+        try:
+            return await fn(*args, **kwargs)
+        except httpx.HTTPStatusError as second_exc:
+            if second_exc.response.status_code == 404:
+                return _err("session_not_found",
+                            f"Session not found on re-discovered backend "
+                            f"({second_exc.request.url})")
+            return _err("backend_error",
+                        f"HTTP {second_exc.response.status_code}: {second_exc}")
+        except Exception as e:
+            return _err("backend_error", f"Failed after re-discovery: {e}")
 
 
 def _summarize_event(etype: str, payload: dict) -> str:
@@ -978,15 +1764,10 @@ def _summarize_event(etype: str, payload: dict) -> str:
 
 
 async def h_list_chats(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         sessions = await b.list_sessions(limit=args.get("limit", 50))
         sessions.sort(key=lambda s: _safe_epoch(s.get("last_active")), reverse=True)
-        # Best-effort cross-reference against the backend's interrupted-session
-        # detector (defect #1: a restart/crash mid-turn leaves a session that
-        # will never reply on its own). Never raises — an older backend
-        # without this endpoint, or a transient failure, just means no
-        # sessions get flagged this call, not a broken list_chats.
         interrupted_ids = {
             s.get("id") for s in await b.list_interrupted_sessions()
         }
@@ -1024,27 +1805,20 @@ async def h_list_chats(args: dict):
                 entry["interrupted"] = True
             result.append(entry)
         return _text(json.dumps({"sessions": result, "count": len(result)}, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted. Will retry on next call.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    return await _retry_handler(_do)
 
 
 async def h_get_chat(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         info = await b.get_session(args["session_id"])
         return _text(json.dumps(info, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    try:
+        return await _retry_handler(_do)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return _err("session_not_found", f"Session {args['session_id']!r} not found")
         return _err("backend_error", f"HTTP {e.response.status_code}: {e}")
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
 
 
 # Verbose fields stripped by compact=True: not needed for a quick skim of
@@ -1088,8 +1862,8 @@ def _truncate_messages(messages: list[dict], max_chars: int = 0,
 
 
 async def h_get_messages(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         last_n = args.get("last_n", 20)
         messages = await b.get_messages(args["session_id"], last_n=last_n)
         max_chars = int(args.get("max_chars", 0) or 0)
@@ -1100,32 +1874,37 @@ async def h_get_messages(args: dict):
             "message_count": len(messages),
             "messages": messages,
         }, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    return await _retry_handler(_do)
 
 
 async def h_send_prompt(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         result = await b.send_prompt(
             args["session_id"],
             args["message"],
             timeout=args.get("timeout", 300),
         )
         return _text(json.dumps(result, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    try:
+        return await _retry_handler(_do)
+    except RuntimeError as e:
+        msg = str(e)
+        if "4007" in msg or "session not found" in msg.lower():
+            return _err(
+                "unpromptable_draft",
+                "This session was created without an initial message and has "
+                "no durable row yet. send_prompt normally bootstraps it "
+                "automatically, but the draft mapping was lost (e.g. MCP "
+                "server restarted). Fix: call create_chat with initial_message, "
+                "or delete this session and start a new one.",
+            )
+        return _err("backend_error", msg)
 
 
 async def h_create_chat(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         created = await b.create_session(
             title=args.get("title", ""),
             cwd=args.get("cwd", ""),
@@ -1133,7 +1912,6 @@ async def h_create_chat(args: dict):
             initial_message=args.get("initial_message", ""),
             prompt_timeout=args.get("timeout", 300),
         )
-        # Warn if cwd was requested but didn't stick
         if args.get("cwd") and created.get("cwd") and created["cwd"] != args["cwd"]:
             created["cwd_warning"] = (
                 f"Requested cwd={args['cwd']!r} but backend used {created['cwd']!r}. "
@@ -1144,65 +1922,56 @@ async def h_create_chat(args: dict):
         else:
             created["persisted"] = False
             created["note"] = (
-                "Empty draft — invisible to list_chats/get_chat until a message is sent."
+                "Empty draft — not yet visible to list_chats/get_chat. "
+                "The first send_prompt against this session_id will "
+                "automatically bootstrap it."
             )
         return _text(json.dumps(created, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    return await _retry_handler(_do)
 
 
 async def h_fork_chat(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         result = await b.branch_session(args["session_id"], title=args.get("title", ""))
         return _text(json.dumps(result, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    try:
+        return await _retry_handler(_do)
     except RuntimeError as e:
         msg = str(e)
         if "empty" in msg.lower():
             return _err("empty_session", msg)
         return _err("backend_error", msg)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
 
 
 async def h_set_model(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         result = await b.set_model(
             args["session_id"],
             args["model"],
             timeout=args.get("timeout", 15),
         )
         return _text(json.dumps(result, indent=2, default=str))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    try:
+        return await _retry_handler(_do)
     except RuntimeError as e:
         return _err("backend_error", str(e))
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
 
 
 async def h_send_prompt_stream(args: dict):
-    b = await _require_backend()
-    session_id = args["session_id"]
-    message = args["message"]
-    timeout = args.get("timeout", 300)
+    async def _do():
+        b = await _require_backend()
+        session_id = args["session_id"]
+        message = args["message"]
+        timeout = args.get("timeout", 300)
 
-    # Access MCP server's request context for progress notifications
-    ctx = _current_server.request_context
-    progress_token = ctx.meta.progressToken if ctx.meta else None
+        ctx = _current_server.request_context
+        progress_token = ctx.meta.progressToken if ctx.meta else None
 
-    events: list[dict] = []
-    final = None
-    progress = 0
-    try:
+        events: list[dict] = []
+        final = None
+        progress = 0
         async for etype, payload in b.send_prompt_stream(session_id, message, timeout=timeout):
             if etype == "__done__":
                 final = payload
@@ -1211,63 +1980,88 @@ async def h_send_prompt_stream(args: dict):
             if progress_token is not None:
                 progress += 1
                 summary = _summarize_event(etype, payload)
-                if summary:  # skip empty deltas
+                if summary:
                     await ctx.session.send_progress_notification(
                         progress_token=progress_token,
                         progress=progress,
                         total=None,
                         message=summary,
                     )
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
 
-    return _text(json.dumps({
-        **(final or {}),
-        "event_count": len(events),
-        "events": events,
-    }, indent=2, default=str))
+        return _text(json.dumps({
+            **(final or {}),
+            "event_count": len(events),
+            "events": events,
+        }, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except RuntimeError as e:
+        msg = str(e)
+        if "4007" in msg or "session not found" in msg.lower():
+            return _err(
+                "unpromptable_draft",
+                "This session was created without an initial message and "
+                "has no durable row yet. send_prompt_stream normally "
+                "bootstraps it automatically, but the draft mapping was "
+                "lost (e.g. MCP server restarted). Fix: call create_chat "
+                "with initial_message, or delete this session and start "
+                "a new one.",
+            )
+        return _err("backend_error", msg)
 
 
 async def h_rename_chat(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         await b.rename_session(args["session_id"], args["title"])
         return _text(json.dumps({"ok": True, "title": args["title"]}))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    return await _retry_handler(_do)
 
 
 async def h_delete_chat(args: dict):
-    b = await _require_backend()
-    try:
+    async def _do():
+        b = await _require_backend()
         await b.delete_session(args["session_id"])
         return _text(json.dumps({"ok": True, "deleted": args["session_id"]}))
-    except httpx.ConnectError:
-        _reset_backend()
-        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
-    except Exception as e:
-        return _err("backend_error", f"Failed: {e}")
+    return await _retry_handler(_do)
 
 
 async def h_backend_status(args: dict):
     try:
         b = await _require_backend()
-        health = await b.health()
+        # health() is informational only — the liveness gate is is_alive()
+        # inside _require_backend.  health() may 404 on working backends
+        # (59681-style) so catch and report as None rather than failing.
+        try:
+            health = await b.health()
+        except Exception:
+            health = {"note": "/health not available on this instance"}
         interrupted = await b.list_interrupted_sessions()
+        ws_available = None
+        try:
+            async with _ws_connect(b):
+                ws_available = True
+        except WsAuthFailure:
+            ws_available = False
+        except Exception:
+            pass
         result = {
             "connected": True,
             "host": b.host,
             "port": b.port,
             "token_configured": bool(b.token),
+            "ws_available": ws_available,
+            "can_create_or_prompt_chats": ws_available,
             "health": health,
             "interrupted_sessions": interrupted,
         }
+        if ws_available is False:
+            result["ws_note"] = (
+                "WebSocket auth is failing: list_chats/get_chat/get_messages "
+                "work, but create_chat, send_prompt, fork_chat and set_model "
+                "cannot. Token re-discovery and a tokenless retry were both "
+                "already attempted. Restart Hermes to mint a fresh token."
+            )
         if interrupted:
             result["note"] = (
                 f"{len(interrupted)} session(s) look interrupted mid-turn "
@@ -1277,12 +2071,64 @@ async def h_backend_status(args: dict):
                 "with get_messages first."
             )
         return _text(json.dumps(result, indent=2, default=str))
+    except BackendAmbiguous as e:
+        return _text(json.dumps({
+            "connected": False,
+            "error": "ambiguous_backend",
+            "message": str(e),
+            "candidate_ports": e.ports,
+            "retryable": False,
+        }, indent=2))
     except Exception as e:
+        try:
+            b = await _find_or_discover_backend()
+            if b is not None:
+                try:
+                    health = await b.health()
+                except Exception:
+                    health = {"note": "/health not available on this instance"}
+                return _text(json.dumps({
+                    "connected": True,
+                    "host": b.host,
+                    "port": b.port,
+                    "token_configured": bool(b.token),
+                    "health": health,
+                    "note": "Re-discovered backend after initial connection failure.",
+                }, indent=2, default=str))
+        except Exception:
+            pass
         return _text(json.dumps({
             "connected": False,
             "error": str(e),
             "retryable": True,
         }, indent=2))
+
+
+async def h_get_metrics(args: dict):
+    """Get operational metrics since last snapshot.
+
+    Returns counters for sessions created/deleted, prompts sent/succeeded/timed_out,
+    bytes transferred, WebSocket reconnects, auth failures, and HTTP errors.
+    Resets counters after snapshot (cumulative metrics start fresh).
+    """
+    try:
+        b = await _require_backend()
+        snap = await b._metrics.snapshot()
+        return _text(json.dumps({
+            "timestamp": snap.timestamp,
+            "sessions_created": snap.sessions_created,
+            "sessions_deleted": snap.sessions_deleted,
+            "prompts_sent": snap.prompts_sent,
+            "prompts_succeeded": snap.prompts_succeeded,
+            "prompts_timed_out": snap.prompts_timed_out,
+            "bytes_sent": snap.bytes_sent,
+            "bytes_received": snap.bytes_received,
+            "ws_reconnects": snap.ws_reconnects,
+            "ws_auth_failures": snap.ws_auth_failures,
+            "http_errors": snap.http_errors,
+        }, indent=2))
+    except Exception as e:
+        return _err("metrics_unavailable", f"Metrics unavailable: {e}")
 
 
 HANDLERS = {
@@ -1297,6 +2143,7 @@ HANDLERS = {
     "rename_chat": h_rename_chat,
     "delete_chat": h_delete_chat,
     "backend_status": h_backend_status,
+    "get_metrics": h_get_metrics,
 }
 
 

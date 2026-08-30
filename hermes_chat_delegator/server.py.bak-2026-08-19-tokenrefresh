@@ -1,0 +1,1603 @@
+"""Hermes Chat Delegator — MCP server for interacting with GUI chats.
+
+Connects to the running hermes serve backend via HTTP REST and WebSocket.
+Read operations (list, get, messages) work via HTTP.
+Mutations (rename, delete) work via HTTP PATCH/DELETE.
+Send prompt works via WebSocket JSON-RPC.
+
+Config (env vars):
+  HERMES_GUI_PORT         — Port of the running backend (default: auto-discover)
+  HERMES_GUI_HOST         — Host (default: 127.0.0.1)
+  HERMES_DASHBOARD_SESSION_TOKEN — Session token for authenticating with the backend.
+                           Read automatically if set by the desktop shell.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from functools import partial
+from typing import Optional
+from urllib.parse import urlencode
+
+import httpx
+import websockets
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import TextContent, Tool
+
+logger = logging.getLogger(__name__)
+
+# The `websockets` client library defaults `max_size` to 2**20 (1,048,576
+# bytes) — any single incoming frame larger than that kills the connection
+# with close code 1009 ("message too big") and no further recovery. Hermes'
+# session.resume response ships the ENTIRE session history in one frame, so
+# any session whose stored transcript exceeds ~1MB becomes permanently
+# unpromptable: every future send_prompt's resume step dies the same way,
+# forever (this was defect #2 — confirmed via hermes' own server-side log:
+# "ws closed ... reason=client_disconnect(code=1009,reason=frame exceeds
+# limit of 1048576 bytes)"). Raise the client-side ceiling well past any
+# realistic session transcript. Configurable via env var for sites with
+# unusually large sessions or tighter memory constraints; 0/negative means
+# "no limit" (matches `websockets`' own convention for max_size=None).
+def _resolve_ws_max_size() -> Optional[int]:
+    raw = os.environ.get("HERMES_WS_MAX_SIZE", "")
+    if raw.strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Ignoring non-integer HERMES_WS_MAX_SIZE=%r", raw)
+        else:
+            return value if value > 0 else None
+    return 64 * 1024 * 1024  # 64 MiB default — generous headroom, still bounded
+
+
+_WS_MAX_SIZE: Optional[int] = _resolve_ws_max_size()
+
+
+async def _recv_response(ws, expected_id: int, timeout: float) -> dict:
+    """Read WS frames until the JSON-RPC reply with id == expected_id.
+
+    The same socket also carries unsolicited `event` broadcasts for any live
+    session (e.g. another GUI tab's traffic), which don't carry our request
+    id. A bare `ws.recv()` can return one of those instead of our reply,
+    causing a KeyError on "result" downstream — skip anything that isn't
+    our numbered response instead of assuming the first frame is it.
+    """
+    async def _loop():
+        while True:
+            resp = json.loads(await ws.recv())
+            if resp.get("id") == expected_id:
+                return resp
+    return await asyncio.wait_for(_loop(), timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Backend connection
+# ---------------------------------------------------------------------------
+
+_SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+
+
+
+# Transport-level hiccups that a bare immediate retry reliably clears: a
+# one-off refused/reset connection right after the backend restarts (the
+# listening socket exists but the ASGI app isn't fully up yet), or a read
+# reset on a connection the OS half-closed. Deliberately narrow — this must
+# never swallow real application errors (4xx/5xx, timeouts long enough to
+# indicate a genuinely stuck backend get their own handling upstream).
+_TRANSIENT_HTTP_ERRORS = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+
+class WsAuthFailure(RuntimeError):
+    """The WebSocket upgrade was rejected for authentication reasons.
+
+    This is the single most common way the delegator "goes down" while
+    looking perfectly healthy, and it is worth stating precisely because the
+    symptom points away from the cause.
+
+    Both the backend port and its session token are *per-boot* values: the
+    desktop shell launches the backend with ``--port 0`` and
+    ``hermes_cli.web_server`` mints ``_SESSION_TOKEN`` with
+    ``secrets.token_urlsafe(32)`` on every start.  The delegator captures the
+    token once, at process start, and pins it into ``os.environ``.  After the
+    backend restarts, that pinned token is stale — and the two halves of the
+    API disagree about whether that matters:
+
+      * ``/api/sessions`` on a headless ``hermes serve`` backend is
+        **unauthenticated**, so it returns 200 for a stale token exactly as
+        it would for a valid one.  ``auto_discover_backend`` therefore
+        confirms the backend, and ``backend_status`` reports
+        ``connected: true``.
+      * ``/api/ws`` **does** validate, and rejects a stale token with 403.
+
+    Verified directly against the live backend: no token -> connects;
+    bogus token -> ``HTTP 403``.  So a stale token is strictly worse than no
+    token at all, which is why the recovery path below drops it.
+    """
+
+    def __init__(self, port: int, status: Optional[int], detail: str = ""):
+        self.port = port
+        self.status = status
+        self.detail = detail
+        super().__init__(
+            f"WebSocket upgrade to Hermes backend on port {port} was rejected "
+            f"(HTTP {status if status is not None else '?'}) after re-discovering "
+            "the session token and retrying without one. The backend is "
+            "answering REST, so this is an auth/token problem, not an outage. "
+            "If it persists, restart Hermes so a fresh token is minted."
+            + (f" [{detail}]" if detail else "")
+        )
+
+
+# Upgrade rejections that indicate an auth problem rather than a transient
+# transport blip. These are the ones worth re-discovering a token for.
+_WS_AUTH_STATUSES = (401, 403)
+
+
+def _ws_status_of(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status from a websockets upgrade failure.
+
+    The `websockets` library has moved this attribute across versions
+    (``InvalidStatusCode.status_code`` in <=11, ``InvalidStatus.response.status_code``
+    in >=12), so probe both shapes and fall back to scraping the message
+    rather than raising a different error while trying to describe this one.
+    """
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if isinstance(status, int):
+        return status
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    m = re.search(r"HTTP (\d{3})", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _ws_url_for(backend: "GuiBackend", token: Optional[str]) -> str:
+    """Build the /api/ws URL using an explicit token (or none)."""
+    base = f"ws://{backend.host}:{backend.port}/api/ws"
+    if token:
+        base += "?" + urlencode({"token": token})
+    return base
+
+
+def _ws_connect(backend: "GuiBackend"):
+    """``websockets.connect`` for a backend, with token self-healing.
+
+    On an auth rejection this does what a human operator would do, in order,
+    without needing the MCP client process to be restarted:
+
+      1. Re-discover the session token from the live backend process and
+         retry.  This repairs the common case — the backend restarted and
+         minted a new token — which previously required restarting Claude
+         Code itself, because nothing in-process ever refreshed the value.
+      2. Failing that, retry with **no** token at all.  A stale token is
+         actively rejected while an absent one is simply not checked on
+         backends that do not require auth, so dropping it strictly widens
+         the set of backends we can talk to.
+      3. Only if all three attempts fail, raise :class:`WsAuthFailure`,
+         which the handler layer reports as retryable and which resets the
+         cached backend so the next call re-discovers from scratch.
+
+    A successful repair is written back onto the backend object, so the very
+    next WS call goes straight through instead of paying for discovery again.
+    """
+
+    class _Ctx:
+        async def __aenter__(self):
+            attempts: list[Optional[str]] = [backend.token]
+
+            last_exc: Optional[BaseException] = None
+            last_status: Optional[int] = None
+            tried_refresh = False
+
+            while attempts:
+                token = attempts.pop(0)
+                try:
+                    self._cm = websockets.connect(
+                        _ws_url_for(backend, token), max_size=_WS_MAX_SIZE
+                    )
+                    conn = await self._cm.__aenter__()
+                    if token != backend.token:
+                        # Persist the repair for subsequent calls.
+                        logger.info(
+                            "WS auth repaired for %s:%s (token %s)",
+                            backend.host, backend.port,
+                            "refreshed" if token else "dropped",
+                        )
+                        backend.token = token or ""
+                    return conn
+                except Exception as exc:
+                    status = _ws_status_of(exc)
+                    if status not in _WS_AUTH_STATUSES:
+                        raise
+                    last_exc, last_status = exc, status
+
+                    if not tried_refresh:
+                        tried_refresh = True
+                        try:
+                            from .token_discovery import refresh_session_token
+
+                            fresh = refresh_session_token()
+                        except Exception:
+                            fresh = None
+                        # Only worth another round-trip if it differs from
+                        # what we just proved does not work.
+                        if fresh and fresh != token:
+                            attempts.append(fresh)
+                        attempts.append(None)  # tokenless last resort
+
+            raise WsAuthFailure(
+                backend.port, last_status,
+                type(last_exc).__name__ if last_exc else "",
+            ) from last_exc
+
+        async def __aexit__(self, *exc_info):
+            return await self._cm.__aexit__(*exc_info)
+
+    return _Ctx()
+
+
+class GuiBackend:
+    def __init__(self, host: str, port: int, token: str = ""):
+        self.host = host
+        self.port = port
+        self.token = token
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5, read=15, write=5, pool=5),
+            headers=self._auth_headers(),
+        )
+
+    def _auth_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.token:
+            headers[_SESSION_HEADER_NAME] = self.token
+        return headers
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def ws_url(self) -> str:
+        base = f"ws://{self.host}:{self.port}/api/ws"
+        # /api/ws authenticates via a ?token= query param, not the
+        # X-Hermes-Session-Token header the REST client uses — the header
+        # is silently ignored on the WS upgrade and the handshake 403s.
+        if self.token:
+            base += "?" + urlencode({"token": self.token})
+        return base
+
+    async def aclose(self):
+        await self._client.aclose()
+
+    async def _request(self, method: str, url: str, *, retries: int = 2,
+                       retry_delay: float = 0.4, **kwargs) -> httpx.Response:
+        """Issue an HTTP request, retrying transient transport failures.
+
+        Observed in a 12h orchestration session: get_messages polls
+        occasionally hit a one-off "not_connected" (httpx.ConnectError) that
+        an immediate retry always cleared — the backend was up throughout,
+        it was a momentary accept-queue/socket blip, not a real outage
+        (defect #4). Retrying HERE, inside the backend client, means every
+        caller (list/get/messages/rename/delete, and the send_prompt polling
+        loop) gets the resilience automatically instead of each call site
+        needing its own retry loop. Does NOT retry HTTP error responses
+        (4xx/5xx) — those are real answers from a reachable server, not
+        transport failures — nor does it retry timeouts (a slow backend
+        should surface as slow, not silently multiply the wait).
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                return await self._client.request(method, url, **kwargs)
+            except _TRANSIENT_HTTP_ERRORS as e:
+                last_exc = e
+                if attempt < retries:
+                    logger.debug(
+                        "Transient %s on %s %s (attempt %d/%d) — retrying",
+                        type(e).__name__, method, url, attempt + 1, retries,
+                    )
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+        assert last_exc is not None
+        raise last_exc
+
+    async def health(self) -> dict:
+        r = await self._request("GET", f"{self.base_url}/health")
+        return r.json()
+
+    async def list_sessions(self, limit: int = 50) -> list[dict]:
+        r = await self._request(
+            "GET", f"{self.base_url}/api/sessions",
+            params={"limit": limit, "min_messages": 0, "order": "recent"},
+        )
+        r.raise_for_status()
+        return r.json().get("sessions", [])
+
+    async def _list_all(self) -> list[dict]:
+        """List all sessions (no limit)."""
+        r = await self._request(
+            "GET", f"{self.base_url}/api/sessions",
+            params={"limit": 500, "min_messages": 0, "order": "recent"},
+        )
+        r.raise_for_status()
+        return r.json().get("sessions", [])
+
+    async def get_session(self, session_id: str) -> dict:
+        r = await self._request("GET", f"{self.base_url}/api/sessions/{session_id}")
+        r.raise_for_status()
+        return r.json()
+
+    async def get_messages(self, session_id: str, last_n: int = 20) -> list[dict]:
+        r = await self._request("GET", f"{self.base_url}/api/sessions/{session_id}/messages")
+        r.raise_for_status()
+        messages = r.json().get("messages", [])
+        if last_n > 0:
+            messages = messages[-last_n:]
+        return messages
+
+    async def list_interrupted_sessions(self) -> list[dict]:
+        """Sessions that look like a backend restart/crash killed them
+        mid-turn (see hermes' GET /api/sessions/interrupted). Empty list on
+        any failure — including talking to a pre-fix backend that doesn't
+        have this endpoint yet (404), which must never break callers that
+        merely want to know "any interrupted sessions?" as a side note.
+        """
+        try:
+            r = await self._request("GET", f"{self.base_url}/api/sessions/interrupted")
+            r.raise_for_status()
+            return r.json().get("sessions", [])
+        except Exception:
+            return []
+
+    async def rename_session(self, session_id: str, title: str) -> dict:
+        r = await self._request(
+            "PATCH", f"{self.base_url}/api/sessions/{session_id}",
+            json={"title": title},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def delete_session(self, session_id: str) -> dict:
+        r = await self._request("DELETE", f"{self.base_url}/api/sessions/{session_id}")
+        r.raise_for_status()
+        return r.json()
+
+    async def _poll_for_reply(self, durable_session_id: str, last_assistant_id,
+                              timeout: float) -> dict:
+        """Poll the REST messages endpoint (durable id only — the live id
+        404s, see send_prompt) until a NEW assistant message appears."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                msgs = await self.get_messages(durable_session_id, last_n=5)
+                for m in reversed(msgs):
+                    if m.get("role") == "assistant":
+                        if last_assistant_id is None or m.get("id") != last_assistant_id:
+                            return {
+                                "response": m.get("content", ""),
+                                "session_id": durable_session_id,
+                                "message_count": len(msgs),
+                                "status": "completed",
+                            }
+                        break  # Still the old one, keep waiting
+            except Exception:
+                pass
+
+        # Timed out. Do one last check in case the reply landed in the
+        # instant between the final poll and here — but NEVER fall back to
+        # echoing last_assistant_id's own (pre-submit) content as if it were
+        # the answer to THIS prompt. Doing that used to make a slow turn look
+        # like it silently answered with stale/wrong text instead of visibly
+        # timing out (defect #5) — a caller that doesn't check `timed_out`
+        # would be misled. `response` is only ever populated here when a
+        # genuinely NEW assistant message was found; otherwise it is
+        # explicitly None with status="pending" so the ambiguity is
+        # impossible to miss.
+        try:
+            msgs = await self.get_messages(durable_session_id, last_n=5)
+        except Exception:
+            msgs = []
+        new_reply = None
+        for m in reversed(msgs):
+            if m.get("role") == "assistant":
+                if last_assistant_id is None or m.get("id") != last_assistant_id:
+                    new_reply = m
+                break  # Only the most recent message counts either way
+
+        if new_reply is not None:
+            return {
+                "response": new_reply.get("content", ""),
+                "session_id": durable_session_id,
+                "message_count": len(msgs),
+                "timed_out": True,
+                "status": "completed_late",
+                "note": (
+                    "The reply arrived right at the timeout boundary — "
+                    "included here so it isn't lost, but the call did exceed "
+                    "the requested timeout."
+                ),
+            }
+        return {
+            "response": None,
+            "session_id": durable_session_id,
+            "message_count": len(msgs),
+            "timed_out": True,
+            "status": "pending",
+            "note": (
+                "No new assistant reply yet — the turn may still be running "
+                "on the backend. This is NOT a stale echo of a previous "
+                "reply: `response` is null on purpose. Poll get_messages() "
+                "on this session_id, or call send_prompt again with a "
+                "longer timeout, to pick up the eventual answer."
+            ),
+        }
+
+    async def create_session(self, title: str = "", cwd: str = "", model: str = "",
+                             initial_message: str = "", timeout: float = 15,
+                             prompt_timeout: float = 300) -> dict:
+        """Create a new live session via session.create.
+
+        If initial_message is given, submits it on the SAME connection using
+        the live id session.create just returned. This must not be done as a
+        separate send_prompt(durable_id, ...) call afterward — a brand-new
+        session has no durable row yet (Hermes persists it on first prompt),
+        so session.resume-by-durable-id 404s (backend error 4007) until
+        after that first submit has happened.
+        """
+        async with _ws_connect(self) as ws:
+            params: dict = {}
+            if title:
+                params["title"] = title
+            if cwd:
+                params["cwd"] = cwd
+            if model:
+                params["model"] = model
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.create", "params": params,
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"session.create failed: {resp['error']}")
+            result = resp["result"]
+            created = {
+                "session_id": result.get("stored_session_id", ""),
+                "live_session_id": result.get("session_id", ""),
+                "title": title or "untitled",
+                "cwd": result.get("info", {}).get("cwd", ""),
+            }
+
+            if initial_message:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                    "params": {"session_id": created["live_session_id"], "text": initial_message},
+                }))
+
+        if initial_message:
+            reply = await self._poll_for_reply(
+                created["session_id"], last_assistant_id=None, timeout=prompt_timeout,
+            )
+            created["initial_response"] = reply["response"]
+            if reply.get("timed_out"):
+                created["initial_response_timed_out"] = True
+
+        return created
+
+    async def branch_session(self, session_id: str, title: str = "",
+                             timeout: float = 15) -> dict:
+        """Branch an existing session, copying its full history."""
+        async with _ws_connect(self) as ws:
+            # Resume the source session to get a live id
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Branch
+            params: dict = {"session_id": live_id}
+            if title:
+                params["name"] = title
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "session.branch", "params": params,
+            }))
+            resp2 = await _recv_response(ws, 2, timeout)
+            if "error" in resp2:
+                err = resp2["error"]
+                if err.get("code") == 4008:
+                    raise RuntimeError(
+                        "Cannot fork an empty chat — send at least one message "
+                        "in the source session first."
+                    )
+                raise RuntimeError(f"session.branch failed: {err}")
+            result = resp2["result"]
+
+        # Resolve the new durable id by matching parent_session_id
+        sessions = await self._list_all()
+        for s in sessions:
+            if s.get("parent_session_id") == session_id:
+                return {
+                    "session_id": s["id"],
+                    "title": result.get("title"),
+                    "forked_from": session_id,
+                }
+        raise RuntimeError(
+            f"session.branch reported success (title={result.get('title')!r}) but no "
+            f"session with parent_session_id={session_id!r} found. Backend may have changed."
+        )
+
+    async def set_model(self, session_id: str, model: str,
+                        timeout: float = 15) -> dict:
+        """Switch the model on an existing session via slash.exec /model.
+
+        Resumes the session to get a live id, then sends ``/model <model>``
+        through the backend's slash command handler. The backend pins the
+        chosen model to this session (model_override) so subsequent prompts
+        use the new model.
+
+        If the session is busy (a turn is in-flight), sends /interrupt first
+        then retries — the gateway's ``_mirror_slash_side_effects`` refuses
+        to mutate a running session.
+        """
+        async with _ws_connect(self) as ws:
+            # Resume to get a live session id
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Execute /model command
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp2 = await _recv_response(ws, 2, timeout)
+            if "error" in resp2:
+                err = resp2["error"]
+                raise RuntimeError(
+                    f"slash.exec /model failed: {err.get('message', err)}"
+                )
+
+        result = resp2.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+
+        # The slash worker validates and outputs "✓ Model switched" regardless,
+        # but the gateway's _mirror_slash_side_effects may refuse to apply the
+        # change if the session is busy. Check the warning field for this.
+        if "session busy" in warning.lower():
+            # Send /interrupt to clear the running flag, then retry
+            interrupt_result = await self._interrupt_and_switch(
+                session_id, model, timeout
+            )
+            interrupt_result["interrupted_first"] = True
+            return interrupt_result
+
+        # Check for common error patterns in the slash output
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+        # Also treat gateway-side sync failures as warnings (non-fatal — the
+        # worker DID save to config.yaml, so the model is globally switched;
+        # the per-session override just didn't stick).
+        if warning and "sync failed" in warning.lower():
+            return {
+                "session_id": session_id,
+                "model": model,
+                "output": output,
+                "warning": warning,
+                "status": "partial",
+                "note": (
+                    "Model saved to config.yaml (global default changed), but "
+                    "the per-session override could not be applied. The new "
+                    "model will take effect on the next session/rebuild."
+                ),
+            }
+
+        return {
+            "session_id": session_id,
+            "model": model,
+            "output": output,
+            "warning": warning or None,
+            "status": "ok",
+        }
+
+    async def _interrupt_and_switch(self, session_id: str, model: str,
+                                    timeout: float = 15) -> dict:
+        """Interrupt a busy session then retry the model switch."""
+        async with _ws_connect(self) as ws:
+            # Resume
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Interrupt
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "session.interrupt",
+                "params": {"session_id": live_id},
+            }))
+            # Don't wait long for interrupt — it may already be done
+            try:
+                await _recv_response(ws, 2, timeout=min(timeout, 5))
+            except (asyncio.TimeoutError, Exception):
+                pass  # interrupt is best-effort
+
+            # Brief pause for the running flag to clear
+            await asyncio.sleep(1)
+
+            # Retry /model
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 3, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp3 = await _recv_response(ws, 3, timeout)
+            if "error" in resp3:
+                err = resp3["error"]
+                raise RuntimeError(
+                    f"slash.exec /model failed after interrupt: "
+                    f"{err.get('message', err)}"
+                )
+
+        result = resp3.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+
+        return {
+            "session_id": session_id,
+            "model": model,
+            "output": output,
+            "warning": warning or None,
+            "status": "ok",
+        }
+
+    async def send_prompt(self, session_id: str, message: str,
+                          timeout: float = 300) -> dict:
+        """Send a prompt via WebSocket. Returns when agent finishes or timeout."""
+        # Get the last assistant message id BEFORE submitting. A brand-new
+        # draft session (from create_session with no prior prompt) has no
+        # durable row yet, so the messages endpoint 404s — that just means
+        # there's no prior baseline, not a real error.
+        try:
+            before_msgs = await self.get_messages(session_id, last_n=5)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                before_msgs = []
+            else:
+                raise
+        last_assistant_id = None
+        for m in reversed(before_msgs):
+            if m.get("role") == "assistant":
+                last_assistant_id = m.get("id")
+                break
+
+        async with _ws_connect(self) as ws:
+            # Resume
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout=15)
+            if "error" in resp:
+                raise RuntimeError("resume failed: " + str(resp.get("error", "unknown")))
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Submit
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                "params": {"session_id": live_id, "text": message},
+            }))
+
+        # Poll via REST (durable id only — the live id 404s here, confirmed
+        # live: 404 on live id, 200 on durable id for the same session).
+        return await self._poll_for_reply(session_id, last_assistant_id, timeout)
+
+    async def send_prompt_stream(self, session_id: str, message: str,
+                                 timeout: float = 300):
+        """Yields (event_type, payload) tuples; last yield is ('__done__', final_dict)."""
+        async with _ws_connect(self) as ws:
+            # Resume
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout=15)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Submit
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                "params": {"session_id": live_id, "text": message},
+            }))
+
+            deadline = time.time() + timeout
+            final_text_parts: list[str] = []
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=max(1.0, deadline - time.time()),
+                    )
+                except asyncio.TimeoutError:
+                    break
+                evt = json.loads(raw)
+                if evt.get("method") != "event":
+                    continue
+                params = evt.get("params", {})
+                if params.get("session_id") != live_id:
+                    continue  # another session's traffic
+                etype = params.get("type")
+                payload = params.get("payload", {})
+                yield (etype, payload)
+                if etype == "message.delta":
+                    final_text_parts.append(
+                        payload.get("delta") or payload.get("text") or ""
+                    )
+                if etype == "message.complete":
+                    content = payload.get("content", "")
+                    yield ("__done__", {
+                        "response": "".join(final_text_parts) or content,
+                        "session_id": session_id,
+                    })
+                    return
+                if etype == "error":
+                    raise RuntimeError(f"agent error mid-turn: {payload}")
+
+            # Timed out
+            yield ("__done__", {
+                "response": "".join(final_text_parts),
+                "session_id": session_id,
+                "timed_out": True,
+            })
+
+
+# ---------------------------------------------------------------------------
+# Auto-discovery
+# ---------------------------------------------------------------------------
+
+def _safe_epoch(v) -> float:
+    """Coerce a value to float epoch, returning 0.0 on failure."""
+    if v is None:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def auto_discover_backend(host: str = "127.0.0.1") -> Optional[int]:
+    """Find the Hermes GUI backend by probing localhost ports concurrently."""
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=5,
+        )
+        ports = set()
+        for line in result.stdout.splitlines():
+            if "LISTEN" in line and "127.0.0.1" in line:
+                m = re.search(r'127\.0\.0\.1:(\d+)', line)
+                if m:
+                    ports.add(int(m.group(1)))
+    except Exception:
+        return None
+
+    if not ports:
+        return None
+
+    session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+
+    async def _probe(port: int) -> tuple[int, int] | None:
+        """Returns (port, strength) — 2 for a confirmed usable backend
+        (``/api/sessions`` actually answers with our auth, if any), 1 for a
+        same-process heuristic match we can't confirm we can talk to.
+        Distinct Hermes components can share a host: e.g. the messaging
+        gateway's OpenAI-compatible API server also serves a Hermes-shaped
+        ``/health`` (including a ``version`` key) but gates ``/api/sessions``
+        behind ``Authorization: Bearer <API_SERVER_KEY>`` — a scheme this
+        client never sends. Matching on ``/health`` alone previously locked
+        onto that gateway instead of the actual dashboard backend, and every
+        session/chat call then 401'd with no way to recover short of manually
+        overriding ``HERMES_GUI_PORT``.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=2) as c:
+                headers = {}
+                if session_token:
+                    headers[_SESSION_HEADER_NAME] = session_token
+                r2 = await c.get(f"http://{host}:{port}/api/sessions", headers=headers)
+                if r2.status_code == 200:
+                    body2 = r2.json()
+                    if isinstance(body2, dict) and "sessions" in body2:
+                        return (port, 2)
+                if r2.status_code == 401:
+                    # Right shape, wrong/missing credential for this port —
+                    # never treat as usable, even as a fallback.
+                    return None
+
+                r = await c.get(f"http://{host}:{port}/health")
+                if r.status_code == 200:
+                    body = r.json()
+                    if any(k in body for k in ("version", "service", "hermes")):
+                        return (port, 1)
+        except Exception:
+            pass
+        return None
+
+    # Probe all candidate ports concurrently, then prefer a confirmed
+    # (/api/sessions-verified) match over a /health-only heuristic one;
+    # break ties by lowest port for determinism.
+    results = await asyncio.gather(*[_probe(p) for p in sorted(ports)])
+    found = [r for r in results if r is not None]
+    if not found:
+        return None
+    found.sort(key=lambda pr: (-pr[1], pr[0]))
+    return found[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+_backend: Optional[GuiBackend] = None
+
+
+async def _port_answers(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Cheap liveness probe for a pinned port.
+
+    Deliberately does not care *what* answers — only that something is
+    listening and speaking HTTP. Distinguishing "the right Hermes" from
+    "something else" is :func:`auto_discover_backend`'s job; this only needs
+    to catch the common case of a pinned port pointing at nothing at all.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            await c.get(f"http://{host}:{port}/api/sessions")
+        return True
+    except Exception:
+        return False
+
+
+async def _require_backend() -> GuiBackend:
+    """Get the backend, lazily discovering if needed."""
+    global _backend
+    if _backend is None:
+        host = os.environ.get("HERMES_GUI_HOST", "127.0.0.1")
+        port_str = os.environ.get("HERMES_GUI_PORT", "")
+        port = None
+        if port_str:
+            # A pinned port is a HINT, not a contract. The backend binds
+            # `--port 0`, so any pinned value is correct only until the next
+            # Hermes restart — and on this machine HERMES_GUI_PORT is also set
+            # persistently at Windows *user* scope (8765, from some earlier
+            # boot), which survives every restart of Hermes, of the client,
+            # and of the machine. Trusting it blindly meant a permanent
+            # "All connection attempts failed" with no fallback, which is
+            # indistinguishable from Hermes being down. Verify it actually
+            # answers before committing to it, and otherwise fall through to
+            # discovery.
+            try:
+                candidate = int(port_str)
+            except ValueError:
+                logger.warning("Ignoring non-integer HERMES_GUI_PORT=%r", port_str)
+            else:
+                if await _port_answers(host, candidate):
+                    port = candidate
+                else:
+                    logger.warning(
+                        "HERMES_GUI_PORT=%s is not answering — falling back to "
+                        "auto-discovery", candidate,
+                    )
+        if port is None:
+            logger.info("Auto-discovering GUI backend...")
+            port = await auto_discover_backend(host)
+            if port is None:
+                raise RuntimeError(
+                    "Not connected to GUI backend — is Hermes running? "
+                    "Set HERMES_GUI_PORT to connect manually."
+                )
+        token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+        _backend = GuiBackend(host, port, token=token)
+        logger.info("Connected to backend on %s:%s", host, port)
+    return _backend
+
+
+def _reset_backend():
+    """Mark backend as disconnected so next call re-discovers."""
+    global _backend
+    _backend = None
+
+
+def _err_ws_auth(e: "WsAuthFailure"):
+    """Report a WS auth failure and force re-discovery on the next call.
+
+    Resetting matters as much as the message. The backend we bound to is
+    answering REST perfectly well, so nothing else in this module would ever
+    invalidate it — meaning every subsequent WS call would fail identically
+    until the MCP client process itself was restarted. Dropping the cached
+    backend means the next call re-runs discovery (picking up a new port if
+    the backend moved) and re-reads the token, so recovery needs no
+    intervention.
+    """
+    _reset_backend()
+    return _err("ws_auth_failed", str(e), retryable=True)
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+TOOLS: list[Tool] = [
+    Tool(
+        name="list_chats",
+        description=(
+            "List all chat sessions visible in the Hermes GUI, sorted by most "
+            "recent activity. Shows active status. Sessions a backend "
+            "restart/crash interrupted mid-turn are flagged with "
+            "interrupted=true (see backend_status for the full list with "
+            "reasoning) — a resume-and-continue candidate, since those "
+            "sessions will not reply on their own."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "Max sessions (default 50)"},
+        }},
+    ),
+    Tool(
+        name="get_chat",
+        description=(
+            "Get detailed info about a specific chat session from the GUI."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session ID"},
+        }, "required": ["session_id"]},
+    ),
+    Tool(
+        name="get_messages",
+        description=(
+            "Get message history from a GUI chat session. Returns the last N "
+            "messages by default (20). Pass last_n=0 for full history. A "
+            "session's full history can run 60K+ chars in one call — use "
+            "max_chars and/or compact to keep the response manageable."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session ID"},
+            "last_n": {"type": "integer", "description": "Only last N messages (default 20, 0=all)"},
+            "max_chars": {
+                "type": "integer",
+                "description": (
+                    "Truncate each message's content/reasoning text to this "
+                    "many characters (0=no limit, default 0). A truncated "
+                    "field gets a matching '<field>_truncated: true' marker "
+                    "and '<field>_original_chars' so truncation is never "
+                    "silent."
+                ),
+            },
+            "compact": {
+                "type": "boolean",
+                "description": (
+                    "Omit verbose fields (reasoning, raw tool-call/result "
+                    "payloads) that aren't needed for a quick skim of the "
+                    "conversation. Default false."
+                ),
+            },
+        }, "required": ["session_id"]},
+    ),
+    Tool(
+        name="send_prompt",
+        description=(
+            "Send a user prompt into a GUI chat session and wait for the agent "
+            "response. The prompt appears in the GUI. Use this for short "
+            "interactions where you just need the final answer. For turns that "
+            "involve multiple tool calls and you want visibility into what the "
+            "agent is doing, use send_prompt_stream instead."
+            " Note: if a human has this session's GUI tab open, using this tool "
+            "will freeze that tab's live view until they reopen/refocus it (known "
+            "backend limitation, not a bug in this server)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to prompt into"},
+            "message": {"type": "string", "description": "The user message"},
+            "timeout": {"type": "number", "description": "Max seconds to wait (default 300). Most turns finish in under 60s."},
+        }, "required": ["session_id", "message"]},
+    ),
+    Tool(
+        name="create_chat",
+        description=(
+            "Create a new chat session in the Hermes GUI. Returns immediately "
+            "with the new session's IDs. IMPORTANT: the new session is NOT yet "
+            "visible to list_chats/get_chat/get_messages until a message has "
+            "actually been sent in it — Hermes only persists the session row on "
+            "first prompt. Pass initial_message to send a first prompt "
+            "immediately and get a session that's fully visible right away; "
+            "omit it to create an empty draft session (matches what the GUI "
+            "does when you click 'New chat'). Note: a bad model name will "
+            "surface as an error on the first send_prompt, not on create_chat. "
+            "Note: if initial_message is provided and a human has this session's "
+            "GUI tab open, using this tool will freeze that tab's live view until "
+            "they reopen/refocus it (known backend limitation, not a bug in this server)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "title": {"type": "string", "description": "Optional title. Untitled if omitted."},
+            "cwd": {"type": "string", "description": "Optional working directory for the new session."},
+            "model": {"type": "string", "description": "Optional model override, e.g. 'xiaomi/mimo-v2.5'."},
+            "initial_message": {
+                "type": "string",
+                "description": (
+                    "Optional first message to send immediately. If provided, "
+                    "this tool waits for the agent's reply (like send_prompt) "
+                    "and the returned session is immediately visible to all "
+                    "other tools. If omitted, an empty draft session is created "
+                    "that other tools cannot see until you call send_prompt on it."
+                ),
+            },
+            "timeout": {"type": "number", "description": "Max seconds to wait for initial_message's reply (default 300). Ignored if initial_message is omitted."},
+        }},
+    ),
+    Tool(
+        name="fork_chat",
+        description=(
+            "Branch a new chat session from an existing one, copying its full "
+            "message history. Equivalent to clicking 'Branch' in the GUI. The "
+            "source session must already have at least one message — forking an "
+            "empty/draft session fails with a clear error."
+            " Note: if a human has the source session's GUI tab open, using this "
+            "tool will freeze that tab's live view until they reopen/refocus it "
+            "(known backend limitation, not a bug in this server)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Durable session ID to fork from."},
+            "title": {"type": "string", "description": "Optional title for the new branch (defaults to '<source title> (branch)')."},
+        }, "required": ["session_id"]},
+    ),
+    Tool(
+        name="set_model",
+        description=(
+            "Switch the AI model for an existing chat session mid-conversation. "
+            "The model is pinned to this session (persists across turns) until "
+            "changed again. Use the provider/model format, e.g. "
+            "'openrouter/anthropic/claude-sonnet-4'. The output field contains "
+            "the backend's /model command output confirming the switch."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to change model on"},
+            "model": {"type": "string", "description": "Model in provider/model format, e.g. 'openrouter/anthropic/claude-sonnet-4'"},
+            "timeout": {"type": "number", "description": "Max seconds to wait (default 15)"},
+        }, "required": ["session_id", "model"]},
+    ),
+    Tool(
+        name="send_prompt_stream",
+        description=(
+            "Send a prompt into a GUI chat session and stream turn progress "
+            "(assistant text as it's generated, tool calls as they start/finish, "
+            "reasoning if enabled) as MCP progress notifications while the agent "
+            "works, then return the full transcript of the turn plus the final "
+            "answer. If your MCP client doesn't display progress notifications, "
+            "this behaves like send_prompt but the final result additionally "
+            "includes every intermediate event (tool calls made, reasoning steps) "
+            "for post-hoc inspection — useful for debugging what the agent "
+            "actually did, not just its final answer. Use this instead of "
+            "send_prompt when the turn might involve multiple tool calls and you "
+            "want visibility into what the agent is doing while you wait."
+            " Note: if a human has this session's GUI tab open, using this tool "
+            "will freeze that tab's live view until they reopen/refocus it (known "
+            "backend limitation, not a bug in this server)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to prompt into"},
+            "message": {"type": "string", "description": "The user message"},
+            "timeout": {"type": "number", "description": "Max seconds to wait (default 300)"},
+        }, "required": ["session_id", "message"]},
+    ),
+    Tool(
+        name="rename_chat",
+        description="Rename a chat session's title in the GUI.",
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to rename"},
+            "title": {"type": "string", "description": "New title"},
+        }, "required": ["session_id", "title"]},
+    ),
+    Tool(
+        name="delete_chat",
+        description="Delete a chat session from the GUI.",
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to delete"},
+        }, "required": ["session_id"]},
+    ),
+    Tool(
+        name="backend_status",
+        description=(
+            "Check the connection to the GUI backend. Reports whether the "
+            "backend is reachable, the port, and basic health info."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def _text(text: str) -> list[TextContent]:
+    return [TextContent(type="text", text=text)]
+
+
+def _err(code: str, msg: str, retryable: bool = False) -> list[TextContent]:
+    return _text(json.dumps({"error": {"code": code, "message": msg, "retryable": retryable}}))
+
+
+def _summarize_event(etype: str, payload: dict) -> str:
+    """One-line human-readable summary of a WS event for progress notifications."""
+    if etype == "message.delta":
+        return payload.get("delta") or payload.get("text") or ""
+    if etype == "message.start":
+        return "agent started thinking"
+    if etype == "message.complete":
+        return "agent finished"
+    if etype == "tool.start":
+        return f"tool: {payload.get('name', '?')} started"
+    if etype == "tool.complete":
+        return f"tool: {payload.get('name', '?')} finished"
+    if etype == "tool.generating":
+        return f"tool: {payload.get('name', '?')} running"
+    if etype == "reasoning.delta":
+        return "reasoning..."
+    if etype == "thinking.delta":
+        return "thinking..."
+    if etype == "status.update":
+        return f"status: {payload.get('status', '?')}"
+    if etype == "error":
+        return f"error: {payload}"
+    if etype == "approval.request":
+        return f"approval needed: {payload.get('tool', '?')}"
+    return str(payload)[:80]
+
+
+async def h_list_chats(args: dict):
+    b = await _require_backend()
+    try:
+        sessions = await b.list_sessions(limit=args.get("limit", 50))
+        sessions.sort(key=lambda s: _safe_epoch(s.get("last_active")), reverse=True)
+        # Best-effort cross-reference against the backend's interrupted-session
+        # detector (defect #1: a restart/crash mid-turn leaves a session that
+        # will never reply on its own). Never raises — an older backend
+        # without this endpoint, or a transient failure, just means no
+        # sessions get flagged this call, not a broken list_chats.
+        interrupted_ids = {
+            s.get("id") for s in await b.list_interrupted_sessions()
+        }
+
+        def _fmt_ts(ts):
+            if not ts:
+                return "unknown"
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            now = datetime.now(tz=timezone.utc)
+            diff = now - dt
+            if diff.total_seconds() < 60:
+                return "just now"
+            elif diff.total_seconds() < 3600:
+                return f"{int(diff.total_seconds() // 60)}m ago"
+            elif diff.total_seconds() < 86400:
+                return f"{int(diff.total_seconds() // 3600)}h ago"
+            else:
+                return dt.strftime("%b %d %H:%M")
+
+        result = []
+        for s in sessions:
+            is_active = s.get("is_active", False)
+            last_active = s.get("last_active")
+            entry = {
+                "session_id": s.get("id", ""),
+                "title": s.get("title") or "untitled",
+                "status": "active" if is_active else _fmt_ts(last_active),
+                "model": s.get("model"),
+                "source": s.get("source"),
+                "message_count": s.get("message_count", 0),
+                "cwd": s.get("cwd"),
+            }
+            if s.get("id") in interrupted_ids:
+                entry["interrupted"] = True
+            result.append(entry)
+        return _text(json.dumps({"sessions": result, "count": len(result)}, indent=2, default=str))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted. Will retry on next call.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_get_chat(args: dict):
+    b = await _require_backend()
+    try:
+        info = await b.get_session(args["session_id"])
+        return _text(json.dumps(info, indent=2, default=str))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return _err("session_not_found", f"Session {args['session_id']!r} not found")
+        return _err("backend_error", f"HTTP {e.response.status_code}: {e}")
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+# Verbose fields stripped by compact=True: not needed for a quick skim of
+# the conversation, but they're what routinely push a get_messages response
+# past 60K chars (defect #6) — raw reasoning traces and full tool-call/result
+# payloads.
+_COMPACT_DROP_FIELDS = (
+    "reasoning", "reasoning_content", "reasoning_details",
+    "codex_reasoning_items", "codex_message_items", "tool_calls",
+)
+# Text fields eligible for max_chars truncation.
+_TRUNCATABLE_TEXT_FIELDS = ("content", "reasoning", "reasoning_content")
+
+
+def _truncate_messages(messages: list[dict], max_chars: int = 0,
+                       compact: bool = False) -> list[dict]:
+    """Apply the get_messages truncation/compact options (defect #6).
+
+    Never mutates the input messages (copies each dict first). Truncation is
+    never silent: a clipped field gets a sibling '<field>_truncated: true'
+    and '<field>_original_chars' so a caller can tell content was cut rather
+    than that the message was actually short.
+    """
+    if max_chars <= 0 and not compact:
+        return messages
+    out = []
+    for m in messages:
+        m = dict(m)
+        if compact:
+            for field in _COMPACT_DROP_FIELDS:
+                m.pop(field, None)
+        if max_chars > 0:
+            for field in _TRUNCATABLE_TEXT_FIELDS:
+                value = m.get(field)
+                if isinstance(value, str) and len(value) > max_chars:
+                    m[field] = value[:max_chars]
+                    m[f"{field}_truncated"] = True
+                    m[f"{field}_original_chars"] = len(value)
+        out.append(m)
+    return out
+
+
+async def h_get_messages(args: dict):
+    b = await _require_backend()
+    try:
+        last_n = args.get("last_n", 20)
+        messages = await b.get_messages(args["session_id"], last_n=last_n)
+        max_chars = int(args.get("max_chars", 0) or 0)
+        compact = bool(args.get("compact", False))
+        messages = _truncate_messages(messages, max_chars=max_chars, compact=compact)
+        return _text(json.dumps({
+            "session_id": args["session_id"],
+            "message_count": len(messages),
+            "messages": messages,
+        }, indent=2, default=str))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_send_prompt(args: dict):
+    b = await _require_backend()
+    try:
+        result = await b.send_prompt(
+            args["session_id"],
+            args["message"],
+            timeout=args.get("timeout", 300),
+        )
+        return _text(json.dumps(result, indent=2, default=str))
+    except WsAuthFailure as e:
+        return _err_ws_auth(e)
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_create_chat(args: dict):
+    b = await _require_backend()
+    try:
+        created = await b.create_session(
+            title=args.get("title", ""),
+            cwd=args.get("cwd", ""),
+            model=args.get("model", ""),
+            initial_message=args.get("initial_message", ""),
+            prompt_timeout=args.get("timeout", 300),
+        )
+        # Warn if cwd was requested but didn't stick
+        if args.get("cwd") and created.get("cwd") and created["cwd"] != args["cwd"]:
+            created["cwd_warning"] = (
+                f"Requested cwd={args['cwd']!r} but backend used {created['cwd']!r}. "
+                "The path may not exist."
+            )
+        if args.get("initial_message"):
+            created["persisted"] = True
+        else:
+            created["persisted"] = False
+            created["note"] = (
+                "Empty draft — invisible to list_chats/get_chat until a message is sent."
+            )
+        return _text(json.dumps(created, indent=2, default=str))
+    except WsAuthFailure as e:
+        return _err_ws_auth(e)
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_fork_chat(args: dict):
+    b = await _require_backend()
+    try:
+        result = await b.branch_session(args["session_id"], title=args.get("title", ""))
+        return _text(json.dumps(result, indent=2, default=str))
+    except WsAuthFailure as e:
+        return _err_ws_auth(e)
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except RuntimeError as e:
+        msg = str(e)
+        if "empty" in msg.lower():
+            return _err("empty_session", msg)
+        return _err("backend_error", msg)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_set_model(args: dict):
+    b = await _require_backend()
+    try:
+        result = await b.set_model(
+            args["session_id"],
+            args["model"],
+            timeout=args.get("timeout", 15),
+        )
+        return _text(json.dumps(result, indent=2, default=str))
+    except WsAuthFailure as e:
+        return _err_ws_auth(e)
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except RuntimeError as e:
+        return _err("backend_error", str(e))
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_send_prompt_stream(args: dict):
+    b = await _require_backend()
+    session_id = args["session_id"]
+    message = args["message"]
+    timeout = args.get("timeout", 300)
+
+    # Access MCP server's request context for progress notifications
+    ctx = _current_server.request_context
+    progress_token = ctx.meta.progressToken if ctx.meta else None
+
+    events: list[dict] = []
+    final = None
+    progress = 0
+    try:
+        async for etype, payload in b.send_prompt_stream(session_id, message, timeout=timeout):
+            if etype == "__done__":
+                final = payload
+                break
+            events.append({"type": etype, "payload": payload})
+            if progress_token is not None:
+                progress += 1
+                summary = _summarize_event(etype, payload)
+                if summary:  # skip empty deltas
+                    await ctx.session.send_progress_notification(
+                        progress_token=progress_token,
+                        progress=progress,
+                        total=None,
+                        message=summary,
+                    )
+    except WsAuthFailure as e:
+        return _err_ws_auth(e)
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+    return _text(json.dumps({
+        **(final or {}),
+        "event_count": len(events),
+        "events": events,
+    }, indent=2, default=str))
+
+
+async def h_rename_chat(args: dict):
+    b = await _require_backend()
+    try:
+        await b.rename_session(args["session_id"], args["title"])
+        return _text(json.dumps({"ok": True, "title": args["title"]}))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_delete_chat(args: dict):
+    b = await _require_backend()
+    try:
+        await b.delete_session(args["session_id"])
+        return _text(json.dumps({"ok": True, "deleted": args["session_id"]}))
+    except httpx.ConnectError:
+        _reset_backend()
+        return _err("not_connected", "Backend unreachable — it may have restarted.", retryable=True)
+    except Exception as e:
+        return _err("backend_error", f"Failed: {e}")
+
+
+async def h_backend_status(args: dict):
+    try:
+        b = await _require_backend()
+        health = await b.health()
+        interrupted = await b.list_interrupted_sessions()
+        # Report WS reachability explicitly, by actually performing the
+        # upgrade. "connected: true" alone is actively misleading: REST stays
+        # green on a stale token (the headless backend does not authenticate
+        # /api/sessions) while every chat-creating tool 403s, so a caller
+        # checking status before delegating gets a green light and then an
+        # unexplained failure.
+        #
+        # This must be a real handshake, not a GET: a plain GET against a
+        # WebSocket-only route returns 404 even when the route is perfectly
+        # healthy, so a GET-based check reports "unavailable" for a backend
+        # that works fine.
+        ws_available = None
+        try:
+            async with _ws_connect(b):
+                ws_available = True
+        except WsAuthFailure:
+            ws_available = False
+        except Exception:
+            pass
+        result = {
+            "connected": True,
+            "host": b.host,
+            "port": b.port,
+            "token_configured": bool(b.token),
+            "ws_available": ws_available,
+            "can_create_or_prompt_chats": ws_available,
+            "health": health,
+            "interrupted_sessions": interrupted,
+        }
+        if ws_available is False:
+            result["ws_note"] = (
+                "WebSocket auth is failing: list_chats/get_chat/get_messages "
+                "work, but create_chat, send_prompt, fork_chat and set_model "
+                "cannot. Token re-discovery and a tokenless retry were both "
+                "already attempted. Restart Hermes to mint a fresh token."
+            )
+        if interrupted:
+            result["note"] = (
+                f"{len(interrupted)} session(s) look interrupted mid-turn "
+                "(likely a backend restart/crash) and will not reply on "
+                "their own — see interrupted_sessions for ids. Use "
+                "send_prompt on one to nudge it forward, or investigate "
+                "with get_messages first."
+            )
+        return _text(json.dumps(result, indent=2, default=str))
+    except Exception as e:
+        return _text(json.dumps({
+            "connected": False,
+            "error": str(e),
+            "retryable": True,
+        }, indent=2))
+
+
+HANDLERS = {
+    "list_chats": h_list_chats,
+    "get_chat": h_get_chat,
+    "get_messages": h_get_messages,
+    "send_prompt": h_send_prompt,
+    "create_chat": h_create_chat,
+    "fork_chat": h_fork_chat,
+    "set_model": h_set_model,
+    "send_prompt_stream": h_send_prompt_stream,
+    "rename_chat": h_rename_chat,
+    "delete_chat": h_delete_chat,
+    "backend_status": h_backend_status,
+}
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+
+_current_server: Optional[Server] = None
+
+
+def create_server() -> Server:
+    global _current_server
+    server = Server("hermes-chat-delegator")
+    _current_server = server
+
+    @server.list_tools()
+    async def list_tools():
+        return TOOLS
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict):
+        handler = HANDLERS.get(name)
+        if handler is None:
+            return _err("unknown_tool", f"Unknown tool: {name}")
+        try:
+            return await handler(arguments)
+        except Exception as e:
+            logger.exception("Tool %s failed", name)
+            return _err("internal_error", f"Internal error in {name}: {e}")
+
+    return server
+
+
+async def _run():
+    server = create_server()
+    try:
+        # Try connecting at startup, but don't fail if backend isn't up yet
+        try:
+            await _require_backend()
+        except RuntimeError:
+            logger.warning("Backend not available at startup — will retry on first tool call")
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+    finally:
+        if _backend is not None:
+            await _backend.aclose()
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Hermes Chat Delegator MCP Server")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()
