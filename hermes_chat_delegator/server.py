@@ -91,6 +91,7 @@ class PersistentDraftSessions:
         """Add and persist a draft session record."""
         async with self._lock:
             self._cache[record.session_id] = record
+            logger.debug("Added draft session %s (live_id=%s)", record.session_id, record.live_session_id)
             await self._save()
 
     async def remove(self, session_id: str) -> None:
@@ -101,14 +102,15 @@ class PersistentDraftSessions:
 
     async def _save(self) -> None:
         """Atomically persist cache to disk."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: asdict(v) for k, v in self._cache.items()}
-        temp_path = self.path.with_suffix(".tmp")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            data = {k: asdict(v) for k, v in self._cache.items()}
+            temp_path = self.path.with_suffix(".tmp")
             temp_path.write_text(json.dumps(data, indent=2))
             temp_path.replace(self.path)
+            logger.debug("Saved %d draft sessions to %s", len(self._cache), self.path)
         except Exception as e:
-            logger.error("Failed to save draft sessions to %s: %s", self.path, e)
+            logger.error("Failed to save draft sessions to %s: %s", self.path, e, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
