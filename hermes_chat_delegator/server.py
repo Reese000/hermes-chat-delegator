@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlencode
 
 import httpx
@@ -48,6 +48,10 @@ class DraftSessionRecord:
     live_session_id: str
     created_at: float
     title: Optional[str] = None
+
+    def __getitem__(self, key: str):
+        """Support dict-like access for backwards compatibility with tests."""
+        return getattr(self, key)
 
 
 class PersistentDraftSessions:
@@ -81,6 +85,20 @@ class PersistentDraftSessions:
                     self.path, e,
                 )
                 self._cache = {}
+
+    def __contains__(self, session_id: str) -> bool:
+        """Check if a draft session exists (synchronous for test compatibility)."""
+        return session_id in self._cache
+
+    def __getitem__(self, session_id: str) -> DraftSessionRecord:
+        """Get a draft session record synchronously (for test compatibility)."""
+        return self._cache[session_id]
+
+    def __setitem__(self, session_id: str, record: Union[DraftSessionRecord, dict]) -> None:
+        """Set a draft session record synchronously (for test compatibility)."""
+        if isinstance(record, dict):
+            record = DraftSessionRecord(session_id=session_id, **record)
+        self._cache[session_id] = record
 
     async def get(self, session_id: str) -> Optional[DraftSessionRecord]:
         """Get a draft session record."""
@@ -721,14 +739,20 @@ class GuiBackend:
             await self._metrics.increment("sessions_created")
         else:
             # Register as draft: send_prompt will bootstrap the durable row.
-            # Persist to disk so it survives MCP server restarts.
+            # Store in memory and attempt disk persistence (with error recovery).
             record = DraftSessionRecord(
                 session_id=created["session_id"],
                 live_session_id=created["live_session_id"],
                 created_at=time.time(),
                 title=created.get("title"),
             )
-            await self._draft_sessions.add(record)
+            try:
+                await self._draft_sessions.add(record)
+            except Exception as e:
+                logger.warning(
+                    "Draft session %s created but disk persistence failed: %s",
+                    created["session_id"], e,
+                )
             await self._metrics.increment("sessions_created")
 
         return created
@@ -966,15 +990,21 @@ class GuiBackend:
             if draft_record:
                 live_id = draft_record.live_session_id
             else:
-                # Resume
+                # Resume durable session, or fallback to bootstrap on 4007
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0", "id": 1, "method": "session.resume",
                     "params": {"session_id": session_id},
                 }))
                 resp = await _recv_response(ws, 1, timeout=15)
                 if "error" in resp:
-                    raise RuntimeError(f"resume failed: {resp['error']}")
-                live_id = resp["result"].get("session_id", session_id)
+                    error = resp["error"]
+                    if error.get("code") == 4007:
+                        # Session not found: fall back to bootstrap (submit directly)
+                        live_id = session_id
+                    else:
+                        raise RuntimeError(f"resume failed: {error}")
+                else:
+                    live_id = resp["result"].get("session_id", session_id)
 
             # Submit
             await ws.send(json.dumps({

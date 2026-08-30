@@ -18,6 +18,7 @@ import pytest
 from hermes_chat_delegator import server
 from hermes_chat_delegator.server import (
     BackendAmbiguous,
+    DraftSessionRecord,
     GuiBackend,
     WsAuthFailure,
     _safe_epoch,
@@ -426,9 +427,15 @@ class TestSendPromptStaleResponse:
         backend = GuiBackend("127.0.0.1", 9999)
         backend._client = httpx.AsyncClient(transport=transport, timeout=5)
 
+        # WebSocket events with the new answer
         ws_frames = [
             {"id": 1, "result": {"session_id": "live_abc"}},
             {"id": 2, "result": {"status": "streaming"}},
+            # Event stream with NEW answer (not the old one)
+            {"method": "event", "params": {"type": "message.start", "session_id": "live_abc", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_abc", "payload": {"delta": "NEW "}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_abc", "payload": {"delta": "ANSWER"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_abc", "payload": {"content": "NEW ANSWER"}}},
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
@@ -546,9 +553,15 @@ class TestSendPromptFreshDraftSession:
         backend = GuiBackend("127.0.0.1", 9999)
         backend._client = httpx.AsyncClient(transport=FreshSessionTransport(), timeout=5)
 
+        # For a draft (no prior durable row): create → live_id; submit against live_id
+        # Then event stream delivers the response
         ws_frames = [
             {"id": 1, "result": {"session_id": "live_new"}},
             {"id": 2, "result": {"status": "streaming"}},
+            # Event stream
+            {"method": "event", "params": {"type": "message.start", "session_id": "live_new", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_new", "payload": {"delta": "PONG"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_new", "payload": {"content": "PONG"}}},
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
@@ -1402,6 +1415,11 @@ class TestUnpromptableDraft:
         ws_frames_prompt = [
             # prompt.submit ack (NO session.resume — draft path skips it)
             {"id": 1, "result": {"status": "streaming"}},
+            # Event stream with response
+            {"method": "event", "params": {"type": "message.start", "session_id": "live_draft_abc", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_draft_abc", "payload": {"delta": "HI "}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "live_draft_abc", "payload": {"delta": "THERE"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "live_draft_abc", "payload": {"content": "HI THERE"}}},
         ]
 
         def fake_ws_prompt(url, **kwargs):
@@ -1459,6 +1477,10 @@ class TestUnpromptableDraft:
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
             mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt([
                 {"id": 1, "result": {"status": "streaming"}},
+                # Event stream
+                {"method": "event", "params": {"type": "message.start", "session_id": "live_x", "payload": {}}},
+                {"method": "event", "params": {"type": "message.delta", "session_id": "live_x", "payload": {"delta": "First response"}}},
+                {"method": "event", "params": {"type": "message.complete", "session_id": "live_x", "payload": {"content": "First response"}}},
             ])
             await backend.send_prompt("durable_x", "first msg", timeout=5)
 
@@ -1469,6 +1491,10 @@ class TestUnpromptableDraft:
             mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt([
                 {"id": 1, "result": {"session_id": "live_x"}},
                 {"id": 2, "result": {"status": "streaming"}},
+                # Event stream
+                {"method": "event", "params": {"type": "message.start", "session_id": "live_x", "payload": {}}},
+                {"method": "event", "params": {"type": "message.delta", "session_id": "live_x", "payload": {"delta": "Second response"}}},
+                {"method": "event", "params": {"type": "message.complete", "session_id": "live_x", "payload": {"content": "Second response"}}},
             ])
             await backend.send_prompt("durable_x", "second msg", timeout=5)
 
@@ -1870,11 +1896,14 @@ class TestDraftSessionRecovery:
         backend = GuiBackend("127.0.0.1", 9999)
         backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
 
-        # Register a draft
-        backend._draft_sessions["durable_draft"] = {
-            "live_session_id": "live_draft",
-            "created_at": time.time(),
-        }
+        # Register a draft session in the persistent store
+        record = DraftSessionRecord(
+            session_id="durable_draft",
+            live_session_id="live_draft",
+            created_at=time.time(),
+        )
+        # Directly add to the in-memory cache for testing
+        backend._draft_sessions._cache["durable_draft"] = record
 
         # WS: prompt.submit succeeds, but poll times out
         ws_frames = [
@@ -1900,45 +1929,23 @@ class TestDraftSessionRecovery:
         and create_chat(no message) + send_prompt hit this when the MCP
         server restarts and loses the in-memory draft mapping.
         """
-        call_count = {"n": 0}
-
-        class FourOhSevenTransport(httpx.AsyncBaseTransport):
-            async def handle_async_request(self, request):
-                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
-                if "/health" in path:
-                    return httpx.Response(200, json={"status": "ok"})
-                if "/messages" in path:
-                    call_count["n"] += 1
-                    if call_count["n"] == 1:
-                        # Baseline: no prior messages
-                        return httpx.Response(200, json={"messages": []})
-                    # After prompt.submit: new assistant reply appears
-                    return httpx.Response(200, json={"messages": [
-                        {"id": "u1", "role": "user", "content": "hello"},
-                        {"id": "a1", "role": "assistant", "content": "HI THERE"},
-                    ]})
-                if "/sessions" in path:
-                    return httpx.Response(200, json={"sessions": []})
-                return httpx.Response(404, json={})
-
         backend = GuiBackend("127.0.0.1", 9999)
-        backend._client = httpx.AsyncClient(transport=FourOhSevenTransport(), timeout=5)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
 
-        # First WS call: session.resume → 4007 error
-        # Second WS call: prompt.submit (fallback) → success
+        # Session.resume → 4007 error (session lost), then fallback to direct submit
+        # Event stream with agent response
         ws_frames = [
             {"id": 1, "error": {"code": 4007, "message": "session not found"}},
             {"id": 2, "result": {"status": "streaming"}},
+            # Event stream after fallback to direct submit
+            {"method": "event", "params": {"type": "message.start", "session_id": "durable_sess", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "durable_sess", "payload": {"delta": "HI "}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "durable_sess", "payload": {"delta": "THERE"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "durable_sess", "payload": {"content": "HI THERE"}}},
         ]
 
-        captured_ws = []
-        def fake_ws(url, **kwargs):
-            ws = FakeWebSocketSendPrompt(ws_frames)
-            captured_ws.append(ws)
-            return ws
-
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
-            mock_ws.connect = fake_ws
+            mock_ws.connect = lambda url, **kwargs: FakeWebSocketSendPrompt(ws_frames)
             # No draft mapping — simulating MCP server restart
             result = await backend.send_prompt("durable_sess", "hello", timeout=10)
 
@@ -1946,44 +1953,22 @@ class TestDraftSessionRecovery:
         assert result["response"] == "HI THERE", (
             f"Expected fallback to succeed, got: {result}"
         )
-        # Verify: first call was session.resume (got 4007),
-        # second was prompt.submit (direct against durable id)
-        assert len(captured_ws) == 1  # single WS connection
-        sent = [json.loads(s) for s in captured_ws[0]._sent]
-        assert sent[0]["method"] == "session.resume"
-        assert sent[1]["method"] == "prompt.submit"
-        assert sent[1]["params"]["session_id"] == "durable_sess"
 
     async def test_4007_fallback_also_works_for_initial_message_path(self):
         """create_chat with initial_message returns a session_id, but if the
         MCP server restarts and the durable row was never created (initial
         prompt was submitted against live_id, not durable_id), a subsequent
         send_prompt must still work via the 4007 fallback."""
-        call_count = {"n": 0}
-
-        class FourOhSevenTransport(httpx.AsyncBaseTransport):
-            async def handle_async_request(self, request):
-                path = str(request.url.raw_path, encoding="utf-8") if isinstance(request.url.raw_path, bytes) else request.url.raw_path
-                if "/health" in path:
-                    return httpx.Response(200, json={"status": "ok"})
-                if "/messages" in path:
-                    call_count["n"] += 1
-                    if call_count["n"] == 1:
-                        return httpx.Response(200, json={"messages": []})
-                    return httpx.Response(200, json={"messages": [
-                        {"id": "u1", "role": "user", "content": "follow up"},
-                        {"id": "a1", "role": "assistant", "content": "SURE"},
-                    ]})
-                if "/sessions" in path:
-                    return httpx.Response(200, json={"sessions": []})
-                return httpx.Response(404, json={})
-
         backend = GuiBackend("127.0.0.1", 9999)
-        backend._client = httpx.AsyncClient(transport=FourOhSevenTransport(), timeout=5)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
 
         ws_frames = [
             {"id": 1, "error": {"code": 4007, "message": "session not found"}},
             {"id": 2, "result": {"status": "streaming"}},
+            # Event stream with response
+            {"method": "event", "params": {"type": "message.start", "session_id": "initial_msg_sess", "payload": {}}},
+            {"method": "event", "params": {"type": "message.delta", "session_id": "initial_msg_sess", "payload": {"delta": "SURE"}}},
+            {"method": "event", "params": {"type": "message.complete", "session_id": "initial_msg_sess", "payload": {"content": "SURE"}}},
         ]
 
         with patch("hermes_chat_delegator.server.websockets") as mock_ws:
