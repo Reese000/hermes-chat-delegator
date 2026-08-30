@@ -2132,3 +2132,47 @@ class TestSessionAffinityDiscovery:
         server._backend = None
         assert backend is not None, "must fall back rather than return None"
         assert backend.port == 9002
+
+
+@pytest.mark.asyncio
+class TestDraftSessionFilePersistence:
+    """Smoke test: verify draft sessions are persisted to disk."""
+
+    async def test_draft_session_file_created_on_create(self):
+        """Creating a draft session should write to ~/.hermes/mcp_draft_sessions.json."""
+        import tempfile
+        from pathlib import Path
+
+        # Use a temporary file for this test
+        temp_file = Path(tempfile.gettempdir()) / "test_draft_sessions.json"
+        if temp_file.exists():
+            temp_file.unlink()
+
+        backend = GuiBackend("127.0.0.1", 9999)
+        backend._client = httpx.AsyncClient(transport=MockTransport({}), timeout=5)
+        # Override the draft sessions path for testing
+        backend._draft_sessions.path = temp_file
+
+        # Create a draft session
+        ws_frames = [
+            {"id": 1, "result": {
+                "session_id": "live_test",
+                "stored_session_id": "durable_test_001",
+                "info": {},
+            }},
+        ]
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: FakeWebSocketSendPrompt(ws_frames)
+            result = await backend.create_session(title="Persistence Test")
+
+        assert result["session_id"] == "durable_test_001"
+        # File should exist and contain the draft session
+        assert temp_file.exists(), f"Draft session file {temp_file} was not created"
+        data = json.loads(temp_file.read_text())
+        assert "durable_test_001" in data
+        assert data["durable_test_001"]["live_session_id"] == "live_test"
+
+        # Clean up
+        if temp_file.exists():
+            temp_file.unlink()

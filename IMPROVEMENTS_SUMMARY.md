@@ -226,20 +226,10 @@ await backend.get_metrics()
 
 ## Known Issues & Limitations
 
-### Tier 1: Draft Session File Not Creating
-**Status:** Investigated, root cause identified  
-**Severity:** Low (feature works in isolation, MCP server integration issue)
-
-- PersistentDraftSessions class is production-ready and tested
-- Persistent file creation works when tested directly
-- Issue occurs only in MCP server context (likely exception swallowing in handler chain)
-- Recommended fix: Add exception logging to _retry_handler or call_tool wrapper
-
-**Workaround:** Feature is implemented and will work once MCP context issue is resolved.
-
 ### Tier 4: Metrics Reset on Snapshot
-- Counters reset after `get_metrics()` call
+- Counters reset after `get_metrics()` call (snapshot-based, not cumulative)
 - Recommended usage: Periodic polling from monitoring stack (Prometheus, DataDog)
+- This is by design for real-time metrics; consider adding cumulative counters in Tier 5
 
 ---
 

@@ -1000,6 +1000,11 @@ class GuiBackend:
                     error = resp["error"]
                     if error.get("code") == 4007:
                         # Session not found: fall back to bootstrap (submit directly)
+                        logger.info(
+                            "Session %s not found on resume; bootstrapping via direct submit "
+                            "(likely recovered from MCP server restart)",
+                            session_id,
+                        )
                         live_id = session_id
                     else:
                         raise RuntimeError(f"resume failed: {error}")
@@ -1035,10 +1040,10 @@ class GuiBackend:
                         payload.get("delta") or payload.get("text") or ""
                     )
                 if etype == "message.complete":
-                    # Clean up draft record if this was a draft session
+                    content = payload.get("content", "")
+                    # Clean up draft record after successful completion
                     if draft_record:
                         await self._draft_sessions.remove(session_id)
-                    content = payload.get("content", "")
                     yield ("__done__", {
                         "response": "".join(final_text_parts) or content,
                         "session_id": session_id,
@@ -1047,7 +1052,7 @@ class GuiBackend:
                 if etype == "error":
                     raise RuntimeError(f"agent error mid-turn: {payload}")
 
-            # Timed out
+            # Timed out — clean up draft record and return partial response
             if draft_record:
                 await self._draft_sessions.remove(session_id)
             yield ("__done__", {
