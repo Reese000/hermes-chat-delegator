@@ -15,6 +15,7 @@ Config (env vars):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from functools import partial
 from pathlib import Path
@@ -29,12 +31,22 @@ from typing import Optional, Union
 from urllib.parse import urlencode
 
 import httpx
+import psutil
 import websockets
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
+
+# Hermes' GET /api/sessions rejects limit>100 with a bodyless HTTP 422.
+# Verified 2026-09-04 against a live backend by bisecting the query string:
+# limit<=100 -> 200, limit>=101 -> 422, while min_messages/order are always
+# accepted.  The 422 carries no body, so an unclamped request fails with a
+# status code and nothing else to explain it.  Every caller must clamp
+# rather than send its own constant, which is how fork_chat's hardcoded
+# limit=500 came to fail 100% of the time.
+MAX_SESSIONS_LIMIT = 100
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +141,39 @@ class PersistentDraftSessions:
             logger.debug("Saved %d draft sessions to %s", len(self._cache), self.path)
         except Exception as e:
             logger.error("Failed to save draft sessions to %s: %s", self.path, e, exc_info=True)
+
+
+def _read_cached_port(path: Path) -> Optional[tuple[str, int]]:
+    """Read the last-known-good (host, port) from disk, or None if absent/bad.
+
+    The full ``auto_discover_backend`` sweep costs ~15s (netstat + two
+    concurrent probe rounds, one of them after a token refresh) — measured
+    against Hermes's own launcher, this routinely exceeds the 15s
+    ``connect_timeout`` Hermes applies when spawning this server, so the
+    process gets killed just as (or just before) it finishes discovering.
+    The backend's port is stable for the life of a Hermes session, and this
+    server is relaunched by Hermes many times a day, so caching the last
+    successful port and re-verifying it with the existing single-port
+    ``_port_answers`` probe (bounded at ~2s) turns the common case into a
+    sub-2-second startup instead of a 15s one.
+    """
+    try:
+        data = json.loads(path.read_text())
+        host, port = data["host"], int(data["port"])
+        return (host, port)
+    except Exception:
+        return None
+
+
+def _write_cached_port(path: Path, host: str, port: int) -> None:
+    """Atomically persist the last-known-good (host, port) to disk."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps({"host": host, "port": port}))
+        temp_path.replace(path)
+    except Exception as e:
+        logger.warning("Failed to cache backend port to %s: %s", path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +470,15 @@ def _ws_connect(backend: "GuiBackend"):
     return _Ctx()
 
 
+class KanbanApiError(RuntimeError):
+    """Kanban plugin HTTP error (404 = disabled, 4xx/5xx = API error)."""
+
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(detail)
+
+
 class GuiBackend:
     """Client for the Hermes GUI backend.
 
@@ -551,21 +605,38 @@ class GuiBackend:
             return False
 
     async def list_sessions(self, limit: int = 50) -> list[dict]:
+        """List recent sessions, newest first.
+
+        ``limit`` is clamped to ``MAX_SESSIONS_LIMIT``: the backend answers
+        anything above it with a bodyless 422, so passing a caller's number
+        through unchecked turns "you asked for more than we serve" into an
+        opaque internal error.  Clamping degrades to fewer rows, which every
+        caller here can tolerate, instead of returning nothing at all.
+        """
         r = await self._request(
             "GET", f"{self.base_url}/api/sessions",
-            params={"limit": limit, "min_messages": 0, "order": "recent"},
+            params={
+                "limit": min(max(int(limit), 1), MAX_SESSIONS_LIMIT),
+                "min_messages": 0,
+                "order": "recent",
+            },
         )
         r.raise_for_status()
         return r.json().get("sessions", [])
 
     async def _list_all(self) -> list[dict]:
-        """List all sessions (no limit)."""
-        r = await self._request(
-            "GET", f"{self.base_url}/api/sessions",
-            params={"limit": 500, "min_messages": 0, "order": "recent"},
-        )
-        r.raise_for_status()
-        return r.json().get("sessions", [])
+        """List the most recent sessions the backend will serve in one page.
+
+        Formerly requested ``limit=500``, which the backend rejects with a
+        bodyless 422 — that made ``fork_chat`` fail every single call *after*
+        its WebSocket ``session.branch`` had already succeeded, so the fork
+        was created and then orphaned behind an error.
+
+        The only caller resolves a session created moments earlier, and the
+        listing is ordered ``recent``, so the row being looked for is at the
+        very front of the first page; one clamped page is sufficient.
+        """
+        return await self.list_sessions(limit=MAX_SESSIONS_LIMIT)
 
     async def get_session(self, session_id: str) -> dict:
         r = await self._request("GET", f"{self.base_url}/api/sessions/{session_id}")
@@ -700,8 +771,8 @@ class GuiBackend:
                 params["title"] = title
             if cwd:
                 params["cwd"] = cwd
-            if model:
-                params["model"] = model
+            # Default to mimo-v2.5 (non-pro) if no model specified
+            params["model"] = model or "xiaomi/mimo-v2.5"
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "session.create", "params": params,
             }))
@@ -940,8 +1011,563 @@ class GuiBackend:
             "status": "ok",
         }
 
+    async def set_model(self, session_id: str, model: str,
+                        timeout: float = 15) -> dict:
+        """Switch the model on an existing session via slash.exec /model."""
+        async with _ws_connect(self) as ws:
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp2 = await _recv_response(ws, 2, timeout)
+            if "error" in resp2:
+                err = resp2["error"]
+                raise RuntimeError(f"slash.exec /model failed: {err.get('message', err)}")
+        result = resp2.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+        if "session busy" in warning.lower():
+            interrupt_result = await self._interrupt_and_switch(session_id, model, timeout)
+            interrupt_result["interrupted_first"] = True
+            return interrupt_result
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+        if warning and "sync failed" in warning.lower():
+            return {"session_id": session_id, "model": model, "output": output,
+                    "warning": warning, "status": "partial",
+                    "note": "Model saved to config.yaml but per-session override failed."}
+        return {"session_id": session_id, "model": model, "output": output,
+                "warning": warning or None, "status": "ok"}
+
+    async def _interrupt_and_switch(self, session_id: str, model: str,
+                                    timeout: float = 15) -> dict:
+        """Interrupt a busy session then retry the model switch."""
+        async with _ws_connect(self) as ws:
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "session.interrupt",
+                "params": {"session_id": live_id},
+            }))
+            try:
+                await _recv_response(ws, 2, timeout=min(timeout, 5))
+            except (asyncio.TimeoutError, Exception):
+                pass
+            await asyncio.sleep(1)
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 3, "method": "slash.exec",
+                "params": {"session_id": live_id, "command": f"/model {model}"},
+            }))
+            resp3 = await _recv_response(ws, 3, timeout)
+            if "error" in resp3:
+                err = resp3["error"]
+                raise RuntimeError(f"slash.exec /model failed after interrupt: {err.get('message', err)}")
+        result = resp3.get("result", {})
+        output = result.get("output", "")
+        warning = result.get("warning", "")
+        lower_out = output.lower()
+        if "could not switch" in lower_out or "not found" in lower_out:
+            raise RuntimeError(f"Model switch failed: {output}")
+        return {"session_id": session_id, "model": model, "output": output,
+                "warning": warning or None, "status": "ok"}
+
+    # ---- Kanban plugin HTTP API (mounted at /api/plugins/kanban/) ----------
+
+    async def _kanban_request(self, method: str, path: str, *, retries: int = 1, **kwargs) -> httpx.Response:
+        """Issue a request to the kanban plugin API with Bearer token auth.
+
+        The kanban plugin uses the same session token as the rest of the
+        backend, but mounted at /api/plugins/kanban/ rather than /api/.
+        404 on the kanban path means the plugin is disabled (not a missing route).
+        """
+        url = f"{self.base_url}/api/plugins/kanban{path}"
+        headers = kwargs.pop("headers", {})
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            resp = await self._request(method, url, headers=headers, retries=retries, **kwargs)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise KanbanApiError(404, "Kanban plugin is not enabled on this Hermes backend. Enable it via config or restart Hermes with the kanban plugin loaded.")
+            raise
+        # Check 404 internally too — callers call raise_for_status() which
+        # would bypass our catch block when the response is returned normally
+        if resp.status_code == 404:
+            raise KanbanApiError(404, "Kanban plugin is not enabled on this Hermes backend. Enable it via config or restart Hermes with the kanban plugin loaded.")
+        return resp
+
+    async def kanban_get_board(self, *, status: Optional[str] = None, assignee: Optional[str] = None,
+                               board: Optional[str] = None, compact: bool = True) -> dict:
+        """GET /board — compact column summary (default) or full payload."""
+        params: dict = {}
+        if board:
+            params["board"] = board
+        r = await self._kanban_request("GET", "/board", params=params)
+        r.raise_for_status()
+        data = r.json()
+        if not compact:
+            return data
+        columns = data.get("columns", [])
+        result = {"columns": [], "assignees": data.get("assignees", [])}
+        for col in columns:
+            tasks_out = []
+            for t in col.get("tasks", []):
+                tasks_out.append({
+                    "id": t.get("id"),
+                    "title": t.get("title", "")[:80],
+                    "status": t.get("status"),
+                    "assignee": t.get("assignee"),
+                    "priority": t.get("priority", 0),
+                })
+            if tasks_out:
+                result["columns"].append({"name": col["name"], "tasks": tasks_out, "count": len(tasks_out)})
+        result["total"] = sum(c["count"] for c in result["columns"])
+        return result
+
+    async def kanban_show_task(self, task_id: str, *, board: Optional[str] = None) -> dict:
+        """GET /tasks/{id} — full task detail with comments, runs, events, log tail."""
+        params: dict = {}
+        if board:
+            params["board"] = board
+        r = await self._kanban_request("GET", f"/tasks/{task_id}", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    async def kanban_create_task(self, *, title: str, body: Optional[str] = None,
+                                 assignee: Optional[str] = None, priority: int = 0,
+                                 parents: Optional[list] = None, skills: Optional[list] = None,
+                                 workspace_kind: Optional[str] = None,
+                                 workspace_path: Optional[str] = None,
+                                 goal_mode: bool = True, goal_max_turns: Optional[int] = None,
+                                 model_override: Optional[str] = None,
+                                 provider_override: Optional[str] = None,
+                                 reasoning_effort: Optional[str] = None,
+                                 max_runtime_seconds: Optional[int] = None,
+                                 triage: bool = False, idempotency_key: Optional[str] = None,
+                                 completion_contract: Optional[str] = None,
+                                 acceptance_criteria: Optional[list] = None,
+                                 board: Optional[str] = None) -> dict:
+        """POST /tasks — create a new kanban task.
+
+        Validates assignee against GET /assignees before creating (the
+        dispatcher silently drops unknown assignees). Auto-generates a
+        deterministic idempotency_key from title+body+assignee if absent
+        to prevent duplicate cards on retries.
+
+        completion_contract: GitHub PR-acceptance gate. Accepted values:
+          "local-only" (default), "OWNER/REPO", or an exact
+          https://github.com/OWNER/REPO/pull/N URL. Absent from the
+          CreateTaskBody API — when non-default, uses the hermes CLI.
+        acceptance_criteria: List of evidence strings appended as a
+          "## Required handoff evidence" section to the body.
+        """
+        import re as _re
+
+        # Validate completion_contract
+        valid_contracts = ("local-only",)
+        contract_is_default = (not completion_contract) or completion_contract in valid_contracts
+        if completion_contract and not contract_is_default:
+            # Must be OWNER/REPO or exact PR URL
+            if not (_re.match(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$', completion_contract) or
+                    _re.match(r'^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+$', completion_contract)):
+                raise ValueError(
+                    f"Invalid completion_contract: {completion_contract!r}. "
+                    "Must be 'local-only', 'OWNER/REPO', or "
+                    "'https://github.com/OWNER/REPO/pull/N'."
+                )
+
+        # Build body with acceptance_criteria
+        effective_body = body or ""
+        if acceptance_criteria:
+            criteria_block = "\n\n## Required handoff evidence\n\n"
+            for i, criterion in enumerate(acceptance_criteria, 1):
+                criteria_block += f"{i}. {criterion}\n"
+            effective_body += criteria_block
+
+        # Validate assignee against known profiles
+        if assignee:
+            try:
+                r = await self._kanban_request("GET", "/assignees",
+                                               params={"board": board} if board else {})
+                r.raise_for_status()
+                valid = [a.strip().lower() for a in r.json().get("assignees", [])]
+                if assignee.strip().lower() not in valid:
+                    raise KanbanApiError(
+                        400,
+                        f"Unknown assignee '{assignee}'. Valid assignees: {', '.join(valid or ['(none)'])}. "
+                        "The dispatcher silently drops tasks with unknown assignees."
+                    )
+            except KanbanApiError:
+                raise
+            except Exception:
+                pass  # Network/validation failure: let the API decide
+
+        # Auto-generate deterministic idempotency key if not provided
+        if not idempotency_key:
+            raw = f"{title}|{effective_body or ''}|{assignee or ''}"
+            idempotency_key = hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+        # When completion_contract is non-default, use the CLI path
+        if not contract_is_default:
+            return await self._kanban_create_via_cli(
+                title=title, body=effective_body, assignee=assignee,
+                priority=priority, parents=parents, skills=skills,
+                workspace_kind=workspace_kind, workspace_path=workspace_path,
+                goal_mode=goal_mode, goal_max_turns=goal_max_turns,
+                model_override=model_override, provider_override=provider_override,
+                reasoning_effort=reasoning_effort, max_runtime_seconds=max_runtime_seconds,
+                triage=triage, idempotency_key=idempotency_key,
+                completion_contract=completion_contract, board=board,
+            )
+
+        payload: dict = {
+            "title": title, "body": effective_body, "assignee": assignee,
+            "priority": priority, "parents": parents or [], "skills": skills,
+            "workspace_kind": workspace_kind, "workspace_path": workspace_path,
+            "goal_mode": goal_mode, "goal_max_turns": goal_max_turns,
+            "model_override": model_override, "provider_override": provider_override,
+            "reasoning_effort": reasoning_effort, "max_runtime_seconds": max_runtime_seconds,
+            "triage": triage, "idempotency_key": idempotency_key,
+        }
+        params_q = {"board": board} if board else {}
+        r = await self._kanban_request("POST", "/tasks", json=payload, params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    async def _kanban_create_via_cli(self, **kwargs) -> dict:
+        """Create a kanban task via the hermes CLI for completion_contract support.
+
+        Uses the full path to hermes.exe (resolved via %LOCALAPPDATA%) because
+        'hermes' is not on PATH in most environments. Runs asynchronously so
+        the event loop is not blocked.
+        """
+        import os
+        hermes_path = os.path.expandvars(r"%LOCALAPPDATA%\hermes\bin\hermes.exe")
+        if not os.path.isfile(hermes_path):
+            raise RuntimeError(
+                f"hermes CLI not found at {hermes_path}. "
+                "Cannot create task via CLI for completion_contract."
+            )
+
+        # Build argv: hermes kanban [--board SLUG] create TITLE [flags] --json
+        cmd = [hermes_path, "kanban"]
+        if kwargs.get("board"):
+            cmd += ["--board", kwargs["board"]]
+        cmd += ["create", kwargs["title"], "--json"]
+
+        if kwargs.get("body"):
+            cmd += ["--body", kwargs["body"]]
+        if kwargs.get("assignee"):
+            cmd += ["--assignee", kwargs["assignee"]]
+        if kwargs.get("priority") is not None:
+            cmd += ["--priority", str(kwargs["priority"])]
+        for p in (kwargs.get("parents") or []):
+            cmd += ["--parent", p]
+        for s in (kwargs.get("skills") or []):
+            cmd += ["--skill", s]
+        if kwargs.get("workspace_kind"):
+            wk = kwargs["workspace_kind"]
+            wp = kwargs.get("workspace_path")
+            if wp and wk in ("dir", "worktree"):
+                cmd += ["--workspace", f"{wk}:{wp}"]
+            else:
+                cmd += ["--workspace", wk]
+        if kwargs.get("goal_mode"):
+            cmd += ["--goal"]
+        if kwargs.get("goal_max_turns") is not None:
+            cmd += ["--goal-max-turns", str(kwargs["goal_max_turns"])]
+        if kwargs.get("model_override"):
+            cmd += ["--model", kwargs["model_override"]]
+        if kwargs.get("provider_override"):
+            cmd += ["--provider", kwargs["provider_override"]]
+        if kwargs.get("max_runtime_seconds") is not None:
+            cmd += ["--max-runtime", str(kwargs["max_runtime_seconds"])]
+        if kwargs.get("triage"):
+            cmd += ["--triage"]
+        if kwargs.get("idempotency_key"):
+            cmd += ["--idempotency-key", kwargs["idempotency_key"]]
+        if kwargs.get("completion_contract"):
+            cmd += ["--completion-contract", kwargs["completion_contract"]]
+
+        # Run asynchronously so we don't block the event loop
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"hermes kanban create timed out after 30s")
+
+        stdout_str = stdout.decode("utf-8", errors="replace")
+        stderr_str = stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"hermes kanban create failed (exit {proc.returncode}): "
+                f"{stderr_str.strip() or stdout_str.strip()}"
+            )
+        try:
+            return json.loads(stdout_str)
+        except json.JSONDecodeError:
+            return {"raw_output": stdout_str.strip()}
+
+    async def kanban_update_task(self, task_id: str, *, board: Optional[str] = None, **fields) -> dict:
+        """PATCH /tasks/{id} — update task fields.
+
+        Supported fields: status, assignee, priority, title, body, block_reason,
+        archive, summary, metadata, model_override, provider_override.
+        """
+        params_q = {"board": board} if board else {}
+        r = await self._kanban_request("PATCH", f"/tasks/{task_id}", json=fields, params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    async def kanban_comment(self, task_id: str, body: str, *,
+                             author: str = "delegator", board: Optional[str] = None) -> dict:
+        """POST /tasks/{id}/comments — add a comment to a task."""
+        payload = {"body": body, "author": author}
+        params_q = {"board": board} if board else {}
+        r = await self._kanban_request("POST", f"/tasks/{task_id}/comments",
+                                       json=payload, params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    async def kanban_link(self, parent_id: str, child_id: str, *,
+                          board: Optional[str] = None) -> dict:
+        """POST /links — create parent→child dependency."""
+        payload = {"parent_id": parent_id, "child_id": child_id}
+        params_q = {"board": board} if board else {}
+        r = await self._kanban_request("POST", "/links", json=payload, params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    async def kanban_dispatch(self, *, board: Optional[str] = None,
+                              dry_run: bool = False, max_n: int = 8) -> dict:
+        """POST /dispatch — nudge the dispatcher to process ready tasks."""
+        params_q: dict = {"dry_run": str(dry_run).lower(), "max": str(max_n)}
+        if board:
+            params_q["board"] = board
+        r = await self._kanban_request("POST", "/dispatch", params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    async def kanban_stats(self, *, board: Optional[str] = None) -> dict:
+        """GET /stats + /workers/active + /diagnostics — combined stats summary."""
+        params_q = {"board": board} if board else {}
+        results = {}
+        for label, path in [("stats", "/stats"), ("workers", "/workers/active"),
+                            ("diagnostics", "/diagnostics")]:
+            try:
+                r = await self._kanban_request("GET", path, params=params_q)
+                r.raise_for_status()
+                results[label] = r.json()
+            except Exception as e:
+                results[label] = {"error": _exc_detail(e)}
+        return results
+
+    async def kanban_decompose(self, task_id: str, *, author: Optional[str] = None,
+                               board: Optional[str] = None) -> dict:
+        """POST /tasks/{id}/decompose — fan out a triage task into children."""
+        payload = {"author": author}
+        params_q = {"board": board} if board else {}
+        r = await self._kanban_request("POST", f"/tasks/{task_id}/decompose",
+                                       json=payload, params=params_q)
+        r.raise_for_status()
+        return r.json()
+
+    # ---- Session control: slash commands, /goal, continuous work ----------
+
+    async def run_slash(self, session_id: str, command: str,
+                        timeout: float = 30) -> dict:
+        """Execute a slash command via WebSocket JSON-RPC.
+
+        Uses "command.dispatch" first (covers quick/plugin/bundle/skill/builtin
+        stages). Falls back to "slash.exec" if command.dispatch returns 4018
+        (not a dispatchable command — e.g. a plugin command that only works
+        through the slash worker path).
+
+        Returns {"output": "...", "ok": true} on success, or error dict.
+        """
+        async with _ws_connect(self) as ws:
+            # Resume session to get live id
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout=15)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            # Parse command to get name + arg
+            cmd_stripped = command.strip().lstrip("/")
+            parts = cmd_stripped.split(None, 1)
+            name = parts[0] if parts else ""
+            arg = parts[1] if len(parts) > 1 else ""
+
+            # Try command.dispatch first
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "command.dispatch",
+                "params": {"session_id": live_id, "name": name, "arg": arg},
+            }))
+            resp2 = await _recv_response(ws, 2, timeout=timeout)
+            if "error" not in resp2:
+                result = resp2.get("result", {})
+                output = result.get("output", "")
+                # command.dispatch returns {type: "send", message: ...} for goal-like commands
+                if result.get("type") == "send":
+                    output = result.get("notice") or output
+                return {"output": output or "(no output)", "ok": True, "raw": result}
+
+            # 4018 = not dispatchable via command.dispatch; fall back to slash.exec
+            err_code = resp2.get("error", {}).get("code")
+            err_msg = resp2.get("error", {}).get("message", "")
+            if err_code == 4018:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 3, "method": "slash.exec",
+                    "params": {"session_id": live_id, "command": f"/{cmd_stripped}"},
+                }))
+                resp3 = await _recv_response(ws, 3, timeout=timeout)
+                if "error" in resp3:
+                    slash_err = resp3["error"]
+                    slash_code = slash_err.get("code", 0)
+                    slash_msg = slash_err.get("message", "")
+                    if slash_code == 5030:
+                        raise RuntimeError(
+                            f"Backend error executing /{cmd_stripped}: {slash_msg}. "
+                            "Check the backend logs at "
+                            "%LOCALAPPDATA%\\hermes\\logs\\errors.log for details."
+                        )
+                    raise RuntimeError(f"slash.exec failed: {slash_err}")
+                result = resp3.get("result", {})
+                return {"output": result.get("output", "") or "(no output)", "ok": True, "raw": result}
+
+            # Other error — including -32603 (backend internal crash)
+            if err_code == -32603:
+                raise RuntimeError(
+                    f"Backend crashed while processing the command (internal error -32603: {err_msg}). "
+                    "Check the backend logs at %LOCALAPPDATA%\\hermes\\logs\\errors.log for the root cause."
+                )
+            raise RuntimeError(f"command.dispatch failed: {resp2['error']}")
+
+    async def set_goal(self, session_id: str, goal: str, *,
+                       gates: Optional[list] = None) -> dict:
+        """Set a goal on a session via /goal slash commands.
+
+        Sends '/goal <text>' then '/goal gate add <cmd>' for each gate,
+        THEN submits the kickoff prompt if one was returned.
+
+        Goal actions (status/pause/resume/clear) are available via
+        goal_action().
+
+        The kickoff prompt is submitted non-blocking: we return as soon as
+        the turn has started, not after the multi-turn goal loop completes.
+        The goal loop runs autonomously on the backend.
+        """
+        results = []
+
+        # 1. Set the goal
+        r = await self.run_slash(session_id, f"/goal {goal}")
+        results.append(r)
+        raw = r.get("raw", {})
+
+        # 2. Add gates BEFORE kickoff so the loop starts with gates active
+        for gate_cmd in (gates or []):
+            r = await self.run_slash(session_id, f"/goal gate add {gate_cmd}")
+            results.append(r)
+
+        # 3. Submit kickoff prompt non-blocking (don't wait for goal loop)
+        if raw.get("type") == "send" and raw.get("message"):
+            cw = _cw_state.get(session_id, False)
+            # Fire-and-forget: submit the kickoff prompt but don't block on
+            # the full goal loop. Use a short timeout just to confirm the
+            # turn started. A goal turn normally exceeds 10s, so a timeout
+            # means the turn IS running — not that it failed.
+            try:
+                kickoff_result = await self.send_prompt(
+                    session_id, raw["message"], timeout=10, continuous_work=cw,
+                )
+                # send_prompt returns {"timed_out": True} when the turn is
+                # still running — this is the EXPECTED case for goal loops.
+                if kickoff_result.get("timed_out"):
+                    results.append({
+                        "kickoff_submitted": True,
+                        "status": "running",
+                        "note": "Goal loop started (turn still running server-side). Use goal_action('status') to check progress.",
+                    })
+                else:
+                    results.append({
+                        "kickoff_submitted": True,
+                        "status": "running",
+                        "response_preview": (kickoff_result.get("response") or "")[:200],
+                        "note": "Goal loop started. Use goal_action('status') to check progress.",
+                    })
+            except Exception as e:
+                results.append({
+                    "kickoff_submitted": False,
+                    "error": str(e),
+                    "note": "Goal was set but kickoff could not be submitted.",
+                })
+
+        return {"ok": all(r.get("ok", True) for r in results), "results": results}
+
+    async def goal_action(self, session_id: str, action: str) -> dict:
+        """Execute a goal control action: status, show, pause, resume, clear."""
+        action = action.strip().lower()
+        if action not in ("status", "show", "pause", "resume", "clear"):
+            raise ValueError(f"Invalid goal action: {action!r}. Use: status, show, pause, resume, clear")
+        return await self.run_slash(session_id, f"/goal {action}")
+
+    async def set_continuous_work(self, session_id: str, enabled: bool) -> dict:
+        """Toggle continuous-work mode via session.set_continuous_work RPC.
+
+        Also updates the in-process CW registry so subsequent sends
+        preserve the state across prompt.submit calls (which reset CW
+        to False when the flag is absent).
+        """
+        async with _ws_connect(self) as ws:
+            # Resume to get live id
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+                "params": {"session_id": session_id},
+            }))
+            resp = await _recv_response(ws, 1, timeout=15)
+            if "error" in resp:
+                raise RuntimeError(f"resume failed: {resp['error']}")
+            live_id = resp["result"].get("session_id", session_id)
+
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "session.set_continuous_work",
+                "params": {"session_id": live_id, "enabled": enabled},
+            }))
+            resp2 = await _recv_response(ws, 2, timeout=10)
+            if "error" in resp2:
+                raise RuntimeError(f"set_continuous_work failed: {resp2['error']}")
+            # Update in-process registry
+            _cw_state[session_id] = enabled
+            return {"ok": True, "enabled": enabled, "session_id": session_id}
+
     async def send_prompt(self, session_id: str, message: str,
-                          timeout: float = 300) -> dict:
+                          timeout: float = 300,
+                          continuous_work: Optional[bool] = None) -> dict:
         """Send a prompt via WebSocket. Returns when agent finishes or timeout.
 
         For draft sessions (created without initial_message), submits the
@@ -951,11 +1577,21 @@ class GuiBackend:
         Internally uses the streaming approach to keep the WebSocket alive
         during message polling. Closing the WS immediately after send causes
         the backend to reap the session as orphaned before the agent starts.
+
+        Args:
+            continuous_work: None (default) resolves from the in-process
+                CW registry (set by set_continuous_work). True/False force
+                the flag. prompt.submit RESETS CW to False when this param
+                is absent, so callers must preserve the state.
         """
+        if continuous_work is None:
+            continuous_work = _cw_state.get(session_id, False)
         # Use send_prompt_stream internally to keep WS alive throughout polling,
         # then return just the final response in send_prompt's traditional format.
         final_result = None
-        async for etype, payload in self.send_prompt_stream(session_id, message, timeout=timeout):
+        async for etype, payload in self.send_prompt_stream(
+            session_id, message, timeout=timeout, continuous_work=continuous_work
+        ):
             if etype == "__done__":
                 final_result = payload
                 break
@@ -978,12 +1614,20 @@ class GuiBackend:
         return final_result
 
     async def send_prompt_stream(self, session_id: str, message: str,
-                                 timeout: float = 300):
+                                 timeout: float = 300,
+                                 continuous_work: Optional[bool] = None):
         """Yields (event_type, payload) tuples; last yield is ('__done__', final_dict).
 
         For draft sessions, submits against the live id directly (same as
         send_prompt's draft path). Removes the draft record after first prompt.
+
+        Args:
+            continuous_work: None (default) resolves from the in-process
+                CW registry. True/False force the flag. prompt.submit
+                RESETS CW to False when absent — callers must preserve state.
         """
+        if continuous_work is None:
+            continuous_work = _cw_state.get(session_id, False)
         draft_record = await self._draft_sessions.get(session_id)
 
         async with _ws_connect(self) as ws:
@@ -1011,10 +1655,14 @@ class GuiBackend:
                 else:
                     live_id = resp["result"].get("session_id", session_id)
 
-            # Submit
+            # Submit — pass continuous_work to prevent prompt.submit from
+            # resetting it to False (see methods_prompt.py:453/457)
+            submit_params: dict = {"session_id": live_id, "text": message}
+            if continuous_work:
+                submit_params["continuous_work"] = True
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
-                "params": {"session_id": live_id, "text": message},
+                "params": submit_params,
             }))
 
             deadline = time.time() + timeout
@@ -1310,6 +1958,13 @@ async def auto_discover_backend(
 
 _backend: Optional[GuiBackend] = None
 
+# Per-session continuous-work state.  prompt.submit RESETS CW to False when
+# the flag is absent (methods_prompt.py:453/457), so any send without it
+# silently disables CW.  This in-process registry lets the delegator
+# preserve CW across sends: set_continuous_work updates it; send_prompt
+# reads it when continuous_work=None (the default).  Explicit False clears.
+_cw_state: dict[str, bool] = {}
+
 
 async def _port_answers(host: str, port: int, timeout: float = 2.0) -> bool:
     """Liveness probe for a pinned port with Hermes identity verification.
@@ -1319,16 +1974,106 @@ async def _port_answers(host: str, port: int, timeout: float = 2.0) -> bool:
     Hermes uniquely exposes.  This prevents adopting a non-Hermes service
     (e.g. Foundry Manager on port 3000) that happens to answer HTTP on
     the same path.
+
+    Sends ``HERMES_DASHBOARD_SESSION_TOKEN`` (if set) the same way the rest
+    of this module authenticates — without it, a token-gated backend 401s
+    and this probe reports "not answering" even when the port is exactly
+    right, silently defeating both the ``HERMES_GUI_PORT`` override and the
+    cached-port fast path in ``_require_backend``.
     """
     try:
+        headers = {}
+        token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+        if token:
+            headers[_SESSION_HEADER_NAME] = token
         async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.get(f"http://{host}:{port}/api/sessions")
+            r = await c.get(f"http://{host}:{port}/api/sessions", headers=headers)
             if r.status_code != 200:
                 return False
             body = r.json()
             return isinstance(body, dict) and "sessions" in body
     except Exception:
         return False
+
+
+async def _probe_port_status(host: str, port: int, timeout: float = 2.0) -> Optional[int]:
+    """Like ``_port_answers`` but distinguishes *why* a port didn't answer.
+
+    Returns the HTTP status code (200 only for a verified Hermes-shaped
+    response with a ``"sessions"`` key; a 200 from some other service on
+    that port is reported as ``None``, same as a hard connection failure),
+    or ``None`` if the connection failed outright (refused/timeout/DNS/etc).
+
+    The caller uses this to skip the expensive PowerShell-based token
+    refresh in ``_require_backend`` when a cached port is simply dead — a
+    fresh token cannot make a closed socket answer, so spending 3-8s
+    shelling out to PowerShell for one is pure waste. That refresh is only
+    worth attempting on a genuine 401 (port alive, token stale).
+    """
+    try:
+        headers = {}
+        token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+        if token:
+            headers[_SESSION_HEADER_NAME] = token
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(f"http://{host}:{port}/api/sessions", headers=headers)
+            if r.status_code == 200:
+                try:
+                    body = r.json()
+                except Exception:
+                    return None
+                if not (isinstance(body, dict) and "sessions" in body):
+                    return None
+            return r.status_code
+    except Exception:
+        return None
+
+
+def _find_backend_port_via_ancestry(max_depth: int = 8) -> Optional[int]:
+    """Find the port of the Hermes backend that actually spawned this process.
+
+    This machine commonly runs several Hermes backends at once — one per
+    profile (default, agent-cam3, agent-deepnest, ...), each on its own
+    ephemeral port. Each backend spawns its own ``chat-delegator``
+    subprocess as a direct process-tree descendant. Port-scanning or
+    caching "last known good port" is unsound in that environment: a
+    cached/scanned port frequently belongs to a *different* profile's
+    backend than the one that launched this particular process — live,
+    reachable, but wrong, so it answers 401 and every "fast path" degrades
+    into the full ~20-port sweep (observed: 24s end to end). Walking our
+    own ancestry to the ``hermes_cli.main ... serve`` process that is our
+    actual parent and reading the port IT listens on is deterministic and
+    fast, and immune to other profiles' backends being alive on other ports.
+    """
+    try:
+        proc = psutil.Process(os.getpid())
+    except Exception:
+        return None
+    for _ in range(max_depth):
+        try:
+            proc = proc.parent()
+        except Exception:
+            return None
+        if proc is None:
+            return None
+        try:
+            cmdline = " ".join(proc.cmdline())
+        except Exception:
+            continue
+        if "hermes_cli.main" not in cmdline:
+            continue
+        try:
+            conns = proc.connections(kind="tcp")
+        except Exception:
+            continue
+        for c in conns:
+            if (
+                c.status == psutil.CONN_LISTEN
+                and c.laddr
+                and c.laddr.ip in ("127.0.0.1", "0.0.0.0", "::1")
+            ):
+                return c.laddr.port
+    return None
 
 
 async def _require_backend() -> GuiBackend:
@@ -1369,6 +2114,36 @@ async def _require_backend() -> GuiBackend:
                     "auto-discovery", candidate,
                 )
     if port is None:
+        ancestry_port = _find_backend_port_via_ancestry()
+        if ancestry_port is not None and await _port_answers(host, ancestry_port):
+            port = ancestry_port
+            logger.info("Resolved backend port via process ancestry: %s:%s", host, port)
+
+    port_cache_path = Path.home() / ".hermes" / "mcp_backend_port.json"
+    if port is None:
+        cached = _read_cached_port(port_cache_path)
+        if cached is not None and cached[0] == host:
+            cached_port = cached[1]
+            status = await _probe_port_status(host, cached_port)
+            if status == 200:
+                port = cached_port
+            elif status == 401:
+                # Port is alive and IS Hermes — the token is just stale.
+                # Only worth the expensive PowerShell-based refresh when we
+                # know a fresh token can actually fix it; see
+                # _probe_port_status docstring for why an unreachable port
+                # (status is None) skips this entirely instead of wasting
+                # 3-8s shelling out to PowerShell for nothing.
+                try:
+                    from .token_discovery import refresh_session_token
+                    fresh = await asyncio.to_thread(refresh_session_token)
+                except Exception:
+                    fresh = None
+                if fresh and await _port_answers(host, cached_port):
+                    port = cached_port
+            if port is not None:
+                logger.info("Reusing cached backend port %s:%s", host, port)
+    if port is None:
         logger.info("Auto-discovering GUI backend...")
         try:
             port = await auto_discover_backend(host)
@@ -1384,6 +2159,7 @@ async def _require_backend() -> GuiBackend:
                 "Not connected to GUI backend — is Hermes running? "
                 "Set HERMES_GUI_PORT to connect manually."
             )
+    _write_cached_port(port_cache_path, host, port)
     token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
     _backend = GuiBackend(host, port, token=token)
     logger.info("Connected to backend on %s:%s", host, port)
@@ -1464,6 +2240,55 @@ def _reset_backend():
     _backend = None
 
 
+async def _require_backend_for_session(session_id: str) -> GuiBackend:
+    """Resolve a backend AND confirm it actually owns ``session_id``.
+
+    The WS prompt path (``send_prompt``/``send_prompt_stream``) has no
+    equivalent of the HTTP 404-triggered re-discovery in ``_retry_handler``:
+    ``prompt.submit`` against a session id the connected backend has never
+    heard of does not error — the server just never emits a matching
+    ``message.complete`` event, so the call silently burns its full timeout
+    (up to 300s) and returns an empty/``timed_out`` result. On a machine
+    running multiple Hermes backends at once (one per profile), landing on
+    the wrong-but-live one is a real, observed failure mode, not a
+    hypothetical.
+
+    This does one cheap HTTP ownership probe (``get_session``, backed by
+    the same 404 that already drives the HTTP retry path) BEFORE opening
+    the WebSocket, so a wrong backend is caught and corrected in a
+    sub-second round trip instead of a multi-minute silent hang.
+
+    Skipped entirely for a known draft session: a draft is legitimately
+    invisible to ``get_session`` on its OWN correct backend (see
+    ``create_session`` — "NOT yet visible to list_chats/get_chat"), so the
+    same 404 that signals "wrong backend" for a durable session is expected
+    and harmless there. Re-discovering on it would chase a false positive
+    and could break the existing bootstrap-on-4007 recovery in
+    ``send_prompt_stream``.
+    """
+    b = await _require_backend()
+    draft_sessions = getattr(b, "_draft_sessions", None)
+    if draft_sessions is not None and await draft_sessions.get(session_id):
+        return b
+    try:
+        await b.get_session(session_id)
+        return b
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+        logger.info(
+            "Backend %s:%s does not own session %s — re-discovering before "
+            "WS submit instead of risking a silent timeout",
+            getattr(b, "host", "?"), getattr(b, "port", "?"), session_id,
+        )
+        return await _reconnect_backend(require_session_id=session_id)
+    except (AttributeError, TypeError):
+        # Backend double (tests) or a future backend variant without
+        # get_session — nothing to verify against, trust the resolved
+        # backend rather than hard-failing the whole prompt path.
+        return b
+
+
 
 
 
@@ -1533,7 +2358,9 @@ TOOLS: list[Tool] = [
             "response. The prompt appears in the GUI. Use this for short "
             "interactions where you just need the final answer. For turns that "
             "involve multiple tool calls and you want visibility into what the "
-            "agent is doing, use send_prompt_stream instead."
+            "agent is doing, use send_prompt_stream instead. "
+            "Continuous work state is automatically preserved across sends "
+            "(resolved from the in-process registry set by set_continuous_work)."
             " Note: if a human has this session's GUI tab open, using this tool "
             "will freeze that tab's live view until they reopen/refocus it (known "
             "backend limitation, not a bug in this server)."
@@ -1557,6 +2384,13 @@ TOOLS: list[Tool] = [
             "against it will automatically bootstrap the durable row "
             "(no error). A bad model name will surface on the first "
             "send_prompt, not on create_chat. "
+            "When goal is set, the session is created, then CW is enabled, "
+            "then the goal is set with gates, then the kickoff prompt is "
+            "submitted. When both goal and initial_message are given, the "
+            "goal is set first and initial_message is sent second. "
+            "Continuous work state is stored in an in-process registry and "
+            "persisted across sends within this delegator process only "
+            "(not across MCP restarts). "
             "Note: if initial_message is provided and a human has this "
             "session's GUI tab open, using this tool will freeze that tab's "
             "live view until they reopen/refocus it (known backend limitation, "
@@ -1577,6 +2411,9 @@ TOOLS: list[Tool] = [
                 ),
             },
             "timeout": {"type": "number", "description": "Max seconds to wait for initial_message's reply (default 300). Ignored if initial_message is omitted."},
+            "goal": {"type": "string", "description": "Optional goal text. Sets a persistent goal on the new session."},
+            "goal_gates": {"type": "array", "items": {"type": "string"}, "description": "Optional quality gate commands for the goal."},
+            "continuous_work": {"type": "boolean", "description": "Optional. Enable continuous work on the new session. Stored in in-process registry."},
         }},
     ),
     Tool(
@@ -1600,13 +2437,18 @@ TOOLS: list[Tool] = [
         description=(
             "Switch the AI model for an existing chat session mid-conversation. "
             "The model is pinned to this session (persists across turns) until "
-            "changed again. Use the provider/model format, e.g. "
-            "'openrouter/anthropic/claude-sonnet-4'. The output field contains "
-            "the backend's /model command output confirming the switch."
+            "changed again. Pass the model id exactly as the provider lists "
+            "it, e.g. 'deepseek/deepseek-v4-flash-0731' or "
+            "'anthropic/claude-sonnet-4' — do NOT prefix the gateway "
+            "('openrouter/...' is rejected; the gateway is already configured "
+            "per session). A rejection lists near-miss candidates, so the "
+            "error text tells you the correct spelling. The output field "
+            "contains the backend's /model command output confirming the "
+            "switch."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Session to change model on"},
-            "model": {"type": "string", "description": "Model in provider/model format, e.g. 'openrouter/anthropic/claude-sonnet-4'"},
+            "model": {"type": "string", "description": "Model id as the provider lists it, e.g. 'deepseek/deepseek-v4-flash-0731'. Do not prefix the gateway ('openrouter/...' is rejected)."},
             "timeout": {"type": "number", "description": "Max seconds to wait (default 15)"},
         }, "required": ["session_id", "model"]},
     ),
@@ -1665,6 +2507,203 @@ TOOLS: list[Tool] = [
             "this call. Use to monitor MCP server health and performance."
         ),
         inputSchema={"type": "object", "properties": {}},
+    ),
+    # ---- Kanban tools -------------------------------------------------------
+    Tool(
+        name="kanban_board",
+        description=(
+            "Get a compact kanban board summary: columns with their tasks, total "
+            "count, and active assignees. Filters: status (column name) and "
+            "assignee. Compact by default — never dumps the full payload."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "status": {"type": "string", "description": "Filter to one column (e.g. 'ready', 'running')"},
+            "assignee": {"type": "string", "description": "Filter tasks by assignee"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+            "compact": {"type": "boolean", "description": "Full payload (default false = compact)"},
+        }},
+    ),
+    Tool(
+        name="kanban_show",
+        description=(
+            "Show a single kanban task with full detail: title, body, status, "
+            "assignee, priority, comments, run history, events, links, and a "
+            "tail of the worker log. Returns 404 if the task doesn't exist."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "Task ID (e.g. 't_123')"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["task_id"]},
+    ),
+    Tool(
+        name="kanban_create",
+        description=(
+            "Create a new kanban task. Validates the assignee against the "
+            "known profile list (the dispatcher silently drops unknown "
+            "assignees). Auto-generates a deterministic idempotency key from "
+            "title+body+assignee to prevent duplicate cards on retries. "
+            "goal_mode defaults to TRUE. completion_contract is a GitHub "
+            "PR-acceptance gate ('local-only', 'OWNER/REPO', or exact PR URL); "
+            "when non-default, uses the hermes CLI. acceptance_criteria appends "
+            "evidence requirements to the body."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "title": {"type": "string", "description": "Task title (required)"},
+            "body": {"type": "string", "description": "Task description / body text"},
+            "assignee": {"type": "string", "description": "Profile name to assign (validated against known assignees)"},
+            "priority": {"type": "integer", "description": "Priority (higher = sooner; default 0)"},
+            "parents": {"type": "array", "items": {"type": "string"}, "description": "Parent task IDs for dependency gating"},
+            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skill names to force-load into the worker"},
+            "workspace_kind": {"type": "string", "description": "'scratch', 'dir', or 'worktree'"},
+            "workspace_path": {"type": "string", "description": "Absolute path for dir/worktree workspace"},
+            "goal_mode": {"type": "boolean", "description": "Run worker in goal loop (default TRUE)"},
+            "goal_max_turns": {"type": "integer", "description": "Turn budget for goal_mode workers"},
+            "model_override": {"type": "string", "description": "Pin worker to this model"},
+            "provider_override": {"type": "string", "description": "Provider for model_override"},
+            "reasoning_effort": {"type": "string", "description": "none|minimal|…|ultra"},
+            "max_runtime_seconds": {"type": "integer", "description": "Per-task runtime cap"},
+            "triage": {"type": "boolean", "description": "Land in triage instead of todo (default false)"},
+            "idempotency_key": {"type": "string", "description": "Deterministic key to prevent duplicate cards on retries"},
+            "completion_contract": {"type": "string", "description": "GitHub PR-acceptance gate: 'local-only' (default), 'OWNER/REPO', or 'https://github.com/OWNER/REPO/pull/N'. When non-default, uses the hermes CLI."},
+            "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Evidence requirements appended as '## Required handoff evidence' section to body"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["title"]},
+    ),
+    Tool(
+        name="kanban_update",
+        description=(
+            "Update a kanban task: reassign, change priority, edit title/body, "
+            "or transition status (block with reason, unblock, archive). "
+            "The 'status' field supports: blocked, ready, todo, triage, review, "
+            "done, archived. Returns the updated task on success."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "Task ID to update"},
+            "assignee": {"type": "string", "description": "New assignee (empty string to unassign)"},
+            "priority": {"type": "integer", "description": "New priority"},
+            "title": {"type": "string", "description": "New title"},
+            "body": {"type": "string", "description": "New body text"},
+            "status": {"type": "string", "description": "Status transition: blocked, ready, todo, triage, review, done, archived"},
+            "block_reason": {"type": "string", "description": "Reason when status=blocked"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["task_id"]},
+    ),
+    Tool(
+        name="kanban_comment",
+        description="Add a comment to a kanban task.",
+        inputSchema={"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "Task ID"},
+            "body": {"type": "string", "description": "Comment text (markdown supported)"},
+            "author": {"type": "string", "description": "Comment author (default 'delegator')"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["task_id", "body"]},
+    ),
+    Tool(
+        name="kanban_link",
+        description="Create a parent→child dependency between two kanban tasks.",
+        inputSchema={"type": "object", "properties": {
+            "parent_id": {"type": "string", "description": "Parent task ID"},
+            "child_id": {"type": "string", "description": "Child task ID"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["parent_id", "child_id"]},
+    ),
+    Tool(
+        name="kanban_dispatch",
+        description=(
+            "Nudge the dispatcher to process ready tasks immediately instead "
+            "of waiting for the next tick. Use dry_run=true to preview what "
+            "would be dispatched without actually spawning workers."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "dry_run": {"type": "boolean", "description": "Preview only (default false)"},
+            "max_n": {"type": "integer", "description": "Max tasks to dispatch (default 8)"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }},
+    ),
+    Tool(
+        name="kanban_stats",
+        description=(
+            "Combined kanban statistics: per-status counts, active workers, "
+            "and diagnostics summary. Returns {stats, workers, diagnostics}."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }},
+    ),
+    Tool(
+        name="kanban_decompose",
+        description=(
+            "Fan out a triage task into child tasks via the auxiliary LLM. "
+            "Non-OK is not an error — check the 'ok' field in the response."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "Task ID to decompose"},
+            "author": {"type": "string", "description": "Author name for the decomposition"},
+            "board": {"type": "string", "description": "Board slug (omit for current)"},
+        }, "required": ["task_id"]},
+    ),
+    # ---- Session control tools -----------------------------------------------
+    Tool(
+        name="run_slash",
+        description=(
+            "Execute a slash command on a session via WebSocket JSON-RPC. "
+            "Uses command.dispatch (covers quick/plugin/bundle/skill/builtin "
+            "stages) with fallback to slash.exec. Returns the command's output. "
+            "Examples: '/goal status', '/model deepseek/deepseek-v4-flash-0731', "
+            "'/compress'"
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to run the command on"},
+            "command": {"type": "string", "description": "The slash command including '/' prefix (e.g. '/goal status')"},
+        }, "required": ["session_id", "command"]},
+    ),
+    Tool(
+        name="set_goal",
+        description=(
+            "Set a persistent goal on a session. Goals stay active across "
+            "turns; after each turn an auxiliary-model judge checks if the goal "
+            "is satisfied. Optionally add quality gates (shell commands that "
+            "must pass before the goal is declared done). The goal is set via "
+            "/goal <text> then gates via /goal gate add <cmd>. "
+            "When the backend returns a kickoff prompt, it is automatically "
+            "submitted as a turn so the goal loop starts immediately."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to set the goal on"},
+            "goal": {"type": "string", "description": "The goal objective text"},
+            "gates": {"type": "array", "items": {"type": "string"}, "description": "Shell commands that must pass before goal is done"},
+        }, "required": ["session_id", "goal"]},
+    ),
+    Tool(
+        name="goal_action",
+        description=(
+            "Control an active goal: 'status' (current state), 'show' "
+            "(with contract), 'pause', 'resume', or 'clear' (delete)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session with the active goal"},
+            "action": {"type": "string", "description": "Action: status, show, pause, resume, clear"},
+        }, "required": ["session_id", "action"]},
+    ),
+    Tool(
+        name="set_continuous_work",
+        description=(
+            "Toggle continuous-work mode on a session. When enabled, the "
+            "agent automatically continues working after each turn until "
+            "the goal is satisfied or the budget is exhausted. Uses the "
+            "session.set_continuous_work RPC. CW state is stored in an "
+            "in-process registry (not persisted across MCP server restarts). "
+            "prompt.submit resets CW to False when the flag is absent; the "
+            "registry prevents silent disabling on subsequent sends. "
+            "Explicit False clears the registry. "
+            "NOTE: the backend's session.resume does NOT expose "
+            "continuous_work in its info dict, so CW state is remembered "
+            "only for this delegator process."
+        ),
+        inputSchema={"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "Session to toggle CW on"},
+            "enabled": {"type": "boolean", "description": "Enable (true) or disable (false) continuous work"},
+        }, "required": ["session_id", "enabled"]},
     ),
 ]
 
@@ -1916,7 +2955,7 @@ async def h_get_messages(args: dict):
 
 async def h_send_prompt(args: dict):
     async def _do():
-        b = await _require_backend()
+        b = await _require_backend_for_session(args["session_id"])
         result = await b.send_prompt(
             args["session_id"],
             args["message"],
@@ -1949,13 +2988,39 @@ async def h_create_chat(args: dict):
             initial_message=args.get("initial_message", ""),
             prompt_timeout=args.get("timeout", 300),
         )
+        session_id = created.get("session_id", "")
+
         if args.get("cwd") and created.get("cwd") and created["cwd"] != args["cwd"]:
             created["cwd_warning"] = (
                 f"Requested cwd={args['cwd']!r} but backend used {created['cwd']!r}. "
                 "The path may not exist."
             )
+
+        # G3: Apply CW, goal, and gates in order: create → set CW → set goal → kickoff
+        cw_enabled = args.get("continuous_work")
+        goal_text = args.get("goal")
+        goal_gates = args.get("goal_gates")
+
+        if cw_enabled is not None and session_id:
+            try:
+                await b.set_continuous_work(session_id, cw_enabled)
+                created["continuous_work"] = cw_enabled
+            except Exception as e:
+                created["continuous_work_error"] = str(e)
+
+        if goal_text and session_id:
+            try:
+                goal_result = await b.set_goal(session_id, goal_text, gates=goal_gates)
+                created["goal"] = goal_result
+            except Exception as e:
+                created["goal_error"] = str(e)
+
         if args.get("initial_message"):
             created["persisted"] = True
+            # If goal was set, initial_message is secondary — goal kickoff already ran
+            if not goal_text:
+                # No goal: send initial_message as the first turn
+                pass  # create_session already sent it
         else:
             created["persisted"] = False
             created["note"] = (
@@ -1998,8 +3063,8 @@ async def h_set_model(args: dict):
 
 async def h_send_prompt_stream(args: dict):
     async def _do():
-        b = await _require_backend()
         session_id = args["session_id"]
+        b = await _require_backend_for_session(session_id)
         message = args["message"]
         timeout = args.get("timeout", 300)
 
@@ -2168,6 +3233,239 @@ async def h_get_metrics(args: dict):
         return _err("metrics_unavailable", f"Metrics unavailable: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Kanban tool handlers
+# ---------------------------------------------------------------------------
+
+async def h_kanban_board(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_get_board(
+            status=args.get("status"), assignee=args.get("assignee"),
+            board=args.get("board"), compact=args.get("compact", True),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_show(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_show_task(args["task_id"], board=args.get("board"))
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return _err("kanban_not_found", f"Task {args['task_id']!r} not found")
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_create(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_create_task(
+            title=args["title"], body=args.get("body"),
+            assignee=args.get("assignee"), priority=args.get("priority", 0),
+            parents=args.get("parents"), skills=args.get("skills"),
+            workspace_kind=args.get("workspace_kind"),
+            workspace_path=args.get("workspace_path"),
+            goal_mode=args.get("goal_mode", True),
+            goal_max_turns=args.get("goal_max_turns"),
+            model_override=args.get("model_override"),
+            provider_override=args.get("provider_override"),
+            reasoning_effort=args.get("reasoning_effort"),
+            max_runtime_seconds=args.get("max_runtime_seconds"),
+            triage=args.get("triage", False),
+            idempotency_key=args.get("idempotency_key"),
+            completion_contract=args.get("completion_contract"),
+            acceptance_criteria=args.get("acceptance_criteria"),
+            board=args.get("board"),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_update(args: dict):
+    task_id = args.pop("task_id")
+    board = args.pop("board", None)
+    # Remove None values so we don't overwrite with null
+    fields = {k: v for k, v in args.items() if v is not None}
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_update_task(task_id, board=board, **fields)
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return _err("kanban_not_found", f"Task {task_id!r} not found")
+        if e.response.status_code == 409:
+            return _err("kanban_conflict", f"Conflict: {_exc_detail(e)}")
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_comment(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_comment(
+            args["task_id"], args["body"],
+            author=args.get("author", "delegator"),
+            board=args.get("board"),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return _err("kanban_not_found", f"Task {args['task_id']!r} not found")
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_link(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_link(
+            args["parent_id"], args["child_id"],
+            board=args.get("board"),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except httpx.HTTPStatusError as e:
+        return _err("kanban_error", f"HTTP {e.response.status_code}: {_exc_detail(e)}")
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_dispatch(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_dispatch(
+            board=args.get("board"),
+            dry_run=args.get("dry_run", False),
+            max_n=args.get("max_n", 8),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_stats(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_stats(board=args.get("board"))
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+async def h_kanban_decompose(args: dict):
+    async def _do():
+        b = await _require_backend()
+        data = await b.kanban_decompose(
+            args["task_id"],
+            author=args.get("author"),
+            board=args.get("board"),
+        )
+        return _text(json.dumps(data, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except KanbanApiError as e:
+        return _err("kanban_error", e.detail)
+    except Exception as e:
+        return _err("kanban_error", _exc_detail(e))
+
+
+# ---------------------------------------------------------------------------
+# Session control tool handlers
+# ---------------------------------------------------------------------------
+
+async def h_run_slash(args: dict):
+    async def _do():
+        b = await _require_backend_for_session(args["session_id"])
+        result = await b.run_slash(args["session_id"], args["command"])
+        return _text(json.dumps(result, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except Exception as e:
+        return _err("slash_error", _exc_detail(e))
+
+
+async def h_set_goal(args: dict):
+    async def _do():
+        b = await _require_backend_for_session(args["session_id"])
+        result = await b.set_goal(
+            args["session_id"], args["goal"],
+            gates=args.get("gates"),
+        )
+        return _text(json.dumps(result, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except Exception as e:
+        return _err("goal_error", _exc_detail(e))
+
+
+async def h_goal_action(args: dict):
+    async def _do():
+        b = await _require_backend_for_session(args["session_id"])
+        result = await b.goal_action(args["session_id"], args["action"])
+        return _text(json.dumps(result, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except ValueError as e:
+        return _err("invalid_action", str(e))
+    except Exception as e:
+        return _err("goal_error", _exc_detail(e))
+
+
+async def h_set_continuous_work(args: dict):
+    async def _do():
+        b = await _require_backend_for_session(args["session_id"])
+        result = await b.set_continuous_work(args["session_id"], args["enabled"])
+        return _text(json.dumps(result, indent=2, default=str))
+    try:
+        return await _retry_handler(_do)
+    except Exception as e:
+        return _err("cw_error", _exc_detail(e))
+
+
 HANDLERS = {
     "list_chats": h_list_chats,
     "get_chat": h_get_chat,
@@ -2181,7 +3479,39 @@ HANDLERS = {
     "delete_chat": h_delete_chat,
     "backend_status": h_backend_status,
     "get_metrics": h_get_metrics,
+    # Kanban tools
+    "kanban_board": h_kanban_board,
+    "kanban_show": h_kanban_show,
+    "kanban_create": h_kanban_create,
+    "kanban_update": h_kanban_update,
+    "kanban_comment": h_kanban_comment,
+    "kanban_link": h_kanban_link,
+    "kanban_dispatch": h_kanban_dispatch,
+    "kanban_stats": h_kanban_stats,
+    "kanban_decompose": h_kanban_decompose,
+    # Session control tools
+    "run_slash": h_run_slash,
+    "set_goal": h_set_goal,
+    "goal_action": h_goal_action,
+    "set_continuous_work": h_set_continuous_work,
 }
+
+
+def _exc_detail(e: BaseException) -> str:
+    """Human-readable detail for an exception, never the empty string.
+
+    Several exceptions that reach the tool dispatcher stringify to nothing —
+    a bare ``TimeoutError()`` is the common one — which rendered as
+    "Internal error in list_chats: " with nothing after the colon. A report
+    that names no cause is indistinguishable from a truncated one, so fall
+    back to the type name (and, for an HTTP error, the status) instead.
+    """
+    detail = str(e).strip()
+    if detail:
+        return detail
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"{type(e).__name__} (HTTP {e.response.status_code}, empty body)"
+    return f"{type(e).__name__} (no message)"
 
 
 # ---------------------------------------------------------------------------
@@ -2209,7 +3539,8 @@ def create_server() -> Server:
             return await handler(arguments)
         except Exception as e:
             logger.exception("Tool %s failed", name)
-            return _err("internal_error", f"Internal error in {name}: {e}")
+            return _err("internal_error",
+                        f"Internal error in {name}: {_exc_detail(e)}")
 
     return server
 

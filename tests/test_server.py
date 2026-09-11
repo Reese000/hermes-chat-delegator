@@ -2176,3 +2176,136 @@ class TestDraftSessionFilePersistence:
         # Clean up
         if temp_file.exists():
             temp_file.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Regression: GET /api/sessions rejects limit>100 with a bodyless 422
+# ---------------------------------------------------------------------------
+
+
+class CapEnforcingTransport(httpx.AsyncBaseTransport):
+    """Mimics the real backend's cap on ``/api/sessions?limit=``.
+
+    The live Hermes backend answers ``limit>=101`` with an HTTP 422 that
+    carries **no body** (verified 2026-09-04 by bisecting the query string
+    against a running instance). Reproducing the empty body matters: it is
+    why the original failure surfaced as a bare status code with nothing to
+    explain it.
+    """
+
+    def __init__(self, cap: int = server.MAX_SESSIONS_LIMIT):
+        self.cap = cap
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        limit = request.url.params.get("limit")
+        if limit is not None and int(limit) > self.cap:
+            return httpx.Response(422, content=b"")
+        return httpx.Response(200, json={"sessions": [
+            {"id": "sess_new", "title": "forked", "parent_session_id": "sess_src"},
+        ]})
+
+    @property
+    def limits(self) -> list[int]:
+        return [int(r.url.params["limit"]) for r in self.requests
+                if "limit" in r.url.params]
+
+
+@pytest.fixture
+def capped_backend():
+    transport = CapEnforcingTransport()
+    backend = GuiBackend("127.0.0.1", 9999, token="test-token")
+    backend._client = httpx.AsyncClient(
+        transport=transport, timeout=5, headers=backend._auth_headers(),
+    )
+    return backend, transport
+
+
+@pytest.mark.asyncio
+class TestSessionsLimitCap:
+    async def test_list_sessions_clamps_above_cap(self, capped_backend):
+        """A caller asking for more than the backend serves gets rows, not a 422."""
+        b, t = capped_backend
+        sessions = await b.list_sessions(limit=500)
+        assert sessions, "expected rows back rather than an exception"
+        assert t.limits == [server.MAX_SESSIONS_LIMIT]
+
+    async def test_list_sessions_preserves_limit_under_cap(self, capped_backend):
+        """Clamping must not inflate a small request into a large one."""
+        b, t = capped_backend
+        await b.list_sessions(limit=8)
+        assert t.limits == [8]
+
+    async def test_list_sessions_floors_at_one(self, capped_backend):
+        """limit=0 would be rejected as out of range at the other end."""
+        b, t = capped_backend
+        await b.list_sessions(limit=0)
+        assert t.limits == [1]
+
+    async def test_list_all_stays_within_cap(self, capped_backend):
+        """``_list_all`` previously hardcoded limit=500.
+
+        That made ``fork_chat`` fail on every call, and it failed *after*
+        the WebSocket branch had already created the session — so the fork
+        was orphaned behind an error message.
+        """
+        b, t = capped_backend
+        sessions = await b._list_all()
+        assert [s["id"] for s in sessions] == ["sess_new"]
+        assert t.limits and max(t.limits) <= server.MAX_SESSIONS_LIMIT
+
+    async def test_cap_transport_actually_rejects(self, capped_backend):
+        """Guards the guard: prove the fixture 422s an unclamped request.
+
+        Without this, every assertion above would still pass if the
+        transport silently accepted any limit.
+        """
+        b, t = capped_backend
+        r = await b._request(
+            "GET", f"{b.base_url}/api/sessions", params={"limit": 500},
+        )
+        assert r.status_code == 422
+        assert r.content == b""
+
+
+class TestExcDetail:
+    """``_exc_detail`` must never return an empty string.
+
+    The original dispatcher interpolated ``str(e)`` directly, so a bare
+    ``TimeoutError()`` reported "Internal error in list_chats: " — a message
+    naming no cause at all.
+    """
+
+    def test_empty_exception_str_falls_back_to_type_name(self):
+        assert server._exc_detail(TimeoutError()) == "TimeoutError (no message)"
+
+    def test_whitespace_only_message_is_treated_as_empty(self):
+        assert server._exc_detail(RuntimeError("   ")) == "RuntimeError (no message)"
+
+    def test_real_message_is_preserved_verbatim(self):
+        assert server._exc_detail(RuntimeError("boom")) == "boom"
+
+    def test_bodyless_http_error_reports_its_status(self):
+        """The backend's limit>100 rejection is a 422 with an empty body."""
+        request = httpx.Request("GET", "http://127.0.0.1:9999/api/sessions")
+        response = httpx.Response(422, content=b"", request=request)
+        exc = httpx.HTTPStatusError("", request=request, response=response)
+        detail = server._exc_detail(exc)
+        assert "422" in detail
+        assert detail.strip() != ""
+
+    def test_never_returns_empty_for_any_bare_builtin(self):
+        for exc_type in (TimeoutError, RuntimeError, ValueError, OSError,
+                         ConnectionError, KeyError):
+            assert server._exc_detail(exc_type()).strip() != ""
+
+
+class TestSetModelDocumentsCorrectFormat:
+    def test_description_does_not_advertise_gateway_prefix(self):
+        """The docstring used to show 'openrouter/anthropic/claude-sonnet-4',
+        which the backend rejects outright."""
+        tool = next(t for t in server.TOOLS if t.name == "set_model")
+        blob = tool.description + json.dumps(tool.inputSchema)
+        assert "openrouter/anthropic" not in blob
+        assert "openrouter/..." in blob or "Do not prefix" in blob or "do NOT prefix" in blob
