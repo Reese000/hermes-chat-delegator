@@ -240,6 +240,168 @@ class TestKanbanCreate:
 
 
 # ---------------------------------------------------------------------------
+# Defect 4: kanban_create safety rails (hold / default triage / warning)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestKanbanCreateSafetyRails:
+    """A tester who only wants a card must be able to create one without
+    a live worker being spawned."""
+
+    async def test_hold_forces_triage_and_clears_assignee(self):
+        backend, transport = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_hold"}}),
+        })
+        result = await backend.kanban_create_task(
+            title="Draft card", assignee="default", goal_mode=False, hold=True,
+        )
+        assert result["task"]["id"] == "t_hold"
+        payload = json.loads(transport.requests[-1].content)
+        assert payload["triage"] is True
+        assert not payload.get("assignee")
+
+    async def test_hold_skips_assignee_validation(self):
+        """hold=True clears assignee before validation, so an unknown
+        assignee must not be rejected — the caller is not assigning yet."""
+        backend, transport = _make_kanban_backend({
+            "/tasks": (200, {"task": {"id": "t_hold"}}),
+        })
+        result = await backend.kanban_create_task(
+            title="Draft", assignee="nonexistent-profile", hold=True,
+        )
+        assert result["task"]["id"] == "t_hold"
+        # No /assignees validation call should have been made
+        assert not any("/assignees" in str(r.url) for r in transport.requests)
+
+    async def test_hold_adds_no_dispatch_warning(self):
+        backend, _ = _make_kanban_backend({
+            "/tasks": (200, {"task": {"id": "t_hold"}}),
+        })
+        result = await backend.kanban_create_task(title="Draft", hold=True)
+        assert "warning" not in result
+
+    async def test_default_assignee_no_goal_defaults_to_triage(self):
+        """goal_mode=False + assignee='default' + triage unspecified must
+        land in triage so the dispatcher cannot auto-claim it."""
+        backend, transport = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_safe"}}),
+        })
+        await backend.kanban_create_task(
+            title="Card", assignee="default", goal_mode=False,
+        )
+        payload = json.loads(transport.requests[-1].content)
+        assert payload["triage"] is True
+
+    async def test_empty_assignee_no_goal_defaults_to_triage(self):
+        backend, transport = _make_kanban_backend({
+            "/tasks": (200, {"task": {"id": "t_safe"}}),
+        })
+        await backend.kanban_create_task(title="Card", goal_mode=False)
+        payload = json.loads(transport.requests[-1].content)
+        assert payload["triage"] is True
+
+    async def test_explicit_triage_false_overrides_safe_default(self):
+        """Callers who really want 'default' to spawn can pass triage=false."""
+        backend, transport = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_spawn"}}),
+        })
+        result = await backend.kanban_create_task(
+            title="Card", assignee="default", goal_mode=False, triage=False,
+        )
+        payload = json.loads(transport.requests[-1].content)
+        assert payload["triage"] is False
+        # And it will auto-dispatch → warning must be present
+        assert "warning" in result
+        assert "auto-dispatched" in result["warning"]
+        assert "hold=true" in result["warning"]
+
+    async def test_goal_mode_true_does_not_force_triage(self):
+        """goal_mode=True is the default path; it must keep its old
+        triage=False behaviour when the caller did not opt into hold."""
+        backend, transport = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_goal"}}),
+        })
+        await backend.kanban_create_task(title="Card", assignee="default")
+        payload = json.loads(transport.requests[-1].content)
+        assert payload["triage"] is False
+
+    async def test_auto_dispatch_includes_warning(self):
+        backend, _ = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_warn"}}),
+        })
+        result = await backend.kanban_create_task(
+            title="Card", assignee="default",
+        )
+        assert result["task"]["id"] == "t_warn"
+        assert "warning" in result
+        assert "auto-dispatched" in result["warning"]
+        assert "default" in result["warning"]
+
+    async def test_no_warning_when_triage(self):
+        backend, _ = _make_kanban_backend({
+            "/assignees": (200, {"assignees": ["default"]}),
+            "/tasks": (200, {"task": {"id": "t_tri"}}),
+        })
+        result = await backend.kanban_create_task(
+            title="Card", assignee="default", triage=True,
+        )
+        assert "warning" not in result
+
+    async def test_h_kanban_create_forwards_hold(self):
+        """Handler must pass hold through so the tool schema is not a lie."""
+        captured = {}
+
+        class FakeBackend:
+            async def kanban_create_task(self, **kwargs):
+                captured.update(kwargs)
+                return {"task": {"id": "t_x"}}
+
+        with patch.object(server, "_require_backend", new_callable=AsyncMock) as mock_rb:
+            mock_rb.return_value = FakeBackend()
+            await server.h_kanban_create({
+                "title": "Card", "hold": True, "assignee": "default",
+                "goal_mode": False,
+            })
+
+        assert captured.get("hold") is True
+
+    async def test_h_kanban_create_triage_absent_means_none(self):
+        """Handler must NOT coerce a missing triage to False — None lets
+        the backend method pick the safe default."""
+        captured = {}
+
+        class FakeBackend:
+            async def kanban_create_task(self, **kwargs):
+                captured.update(kwargs)
+                return {"task": {"id": "t_x"}}
+
+        with patch.object(server, "_require_backend", new_callable=AsyncMock) as mock_rb:
+            mock_rb.return_value = FakeBackend()
+            await server.h_kanban_create({
+                "title": "Card", "assignee": "default", "goal_mode": False,
+            })
+
+        assert captured.get("triage") is None
+
+
+class TestKanbanCreateToolSchemaSafety:
+    def test_tool_schema_has_hold_and_documents_safety(self):
+        t = next(x for x in server.TOOLS if x.name == "kanban_create")
+        props = t.inputSchema["properties"]
+        assert "hold" in props
+        assert "hold" in t.description.lower()
+        # Safe default documented
+        assert "triage defaults to True" in t.description or "defaults to True" in t.description
+        # Warning behaviour documented
+        assert "warning" in t.description.lower()
+
+
+# ---------------------------------------------------------------------------
 # G1: CLI path tests
 # ---------------------------------------------------------------------------
 

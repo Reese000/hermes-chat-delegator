@@ -875,7 +875,7 @@ class GuiBackend:
         )
 
     async def set_model(self, session_id: str, model: str,
-                        timeout: float = 15) -> dict:
+                        timeout: float = 30) -> dict:
         """Switch the model on an existing session via slash.exec /model.
 
         Resumes the session to get a live id, then sends ``/model <model>``
@@ -886,6 +886,31 @@ class GuiBackend:
         If the session is busy (a turn is in-flight), sends /interrupt first
         then retries — the gateway's ``_mirror_slash_side_effects`` refuses
         to mutate a running session.
+
+        On TimeoutError the attempt is retried ONCE with a doubled timeout
+        (minimum 30s). Resume + slash.exec on a session that just had a turn
+        interrupted frequently exceeds a tight budget; a single retry absorbs
+        that without hiding a genuinely stuck backend. A second TimeoutError
+        propagates so the tool handler can surface a structured retryable
+        ``model_switch_timeout`` error.
+        """
+        try:
+            return await self._set_model_once(session_id, model, timeout)
+        except TimeoutError:
+            retry_timeout = max(float(timeout) * 2.0, 30.0)
+            logger.info(
+                "set_model timed out after %.0fs for %s — retrying once with %.0fs",
+                timeout, session_id, retry_timeout,
+            )
+            return await self._set_model_once(session_id, model, retry_timeout)
+
+    async def _set_model_once(self, session_id: str, model: str,
+                              timeout: float) -> dict:
+        """One set_model attempt over a single WebSocket connection.
+
+        Raises TimeoutError if resume or slash.exec does not reply within
+        ``timeout`` seconds. Kept separate from set_model so the automatic
+        timeout retry does not re-enter the busy-session interrupt path.
         """
         async with _ws_connect(self) as ws:
             # Resume to get a live session id
@@ -955,8 +980,14 @@ class GuiBackend:
         }
 
     async def _interrupt_and_switch(self, session_id: str, model: str,
-                                    timeout: float = 15) -> dict:
-        """Interrupt a busy session then retry the model switch."""
+                                    timeout: float = 30) -> dict:
+        """Interrupt a busy session then retry the model switch.
+
+        Best-effort: the interrupt reply is not required (the turn may already
+        be finished by the time we send it), so a timeout on interrupt is
+        swallowed. The subsequent slash.exec still has the full ``timeout``
+        budget.
+        """
         async with _ws_connect(self) as ws:
             # Resume
             await ws.send(json.dumps({
@@ -976,7 +1007,7 @@ class GuiBackend:
             # Don't wait long for interrupt — it may already be done
             try:
                 await _recv_response(ws, 2, timeout=min(timeout, 5))
-            except (asyncio.TimeoutError, Exception):
+            except (TimeoutError, Exception):
                 pass  # interrupt is best-effort
 
             # Brief pause for the running flag to clear
@@ -1010,81 +1041,6 @@ class GuiBackend:
             "warning": warning or None,
             "status": "ok",
         }
-
-    async def set_model(self, session_id: str, model: str,
-                        timeout: float = 15) -> dict:
-        """Switch the model on an existing session via slash.exec /model."""
-        async with _ws_connect(self) as ws:
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
-                "params": {"session_id": session_id},
-            }))
-            resp = await _recv_response(ws, 1, timeout)
-            if "error" in resp:
-                raise RuntimeError(f"resume failed: {resp['error']}")
-            live_id = resp["result"].get("session_id", session_id)
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 2, "method": "slash.exec",
-                "params": {"session_id": live_id, "command": f"/model {model}"},
-            }))
-            resp2 = await _recv_response(ws, 2, timeout)
-            if "error" in resp2:
-                err = resp2["error"]
-                raise RuntimeError(f"slash.exec /model failed: {err.get('message', err)}")
-        result = resp2.get("result", {})
-        output = result.get("output", "")
-        warning = result.get("warning", "")
-        if "session busy" in warning.lower():
-            interrupt_result = await self._interrupt_and_switch(session_id, model, timeout)
-            interrupt_result["interrupted_first"] = True
-            return interrupt_result
-        lower_out = output.lower()
-        if "could not switch" in lower_out or "not found" in lower_out:
-            raise RuntimeError(f"Model switch failed: {output}")
-        if warning and "sync failed" in warning.lower():
-            return {"session_id": session_id, "model": model, "output": output,
-                    "warning": warning, "status": "partial",
-                    "note": "Model saved to config.yaml but per-session override failed."}
-        return {"session_id": session_id, "model": model, "output": output,
-                "warning": warning or None, "status": "ok"}
-
-    async def _interrupt_and_switch(self, session_id: str, model: str,
-                                    timeout: float = 15) -> dict:
-        """Interrupt a busy session then retry the model switch."""
-        async with _ws_connect(self) as ws:
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "session.resume",
-                "params": {"session_id": session_id},
-            }))
-            resp = await _recv_response(ws, 1, timeout)
-            if "error" in resp:
-                raise RuntimeError(f"resume failed: {resp['error']}")
-            live_id = resp["result"].get("session_id", session_id)
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 2, "method": "session.interrupt",
-                "params": {"session_id": live_id},
-            }))
-            try:
-                await _recv_response(ws, 2, timeout=min(timeout, 5))
-            except (asyncio.TimeoutError, Exception):
-                pass
-            await asyncio.sleep(1)
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": 3, "method": "slash.exec",
-                "params": {"session_id": live_id, "command": f"/model {model}"},
-            }))
-            resp3 = await _recv_response(ws, 3, timeout)
-            if "error" in resp3:
-                err = resp3["error"]
-                raise RuntimeError(f"slash.exec /model failed after interrupt: {err.get('message', err)}")
-        result = resp3.get("result", {})
-        output = result.get("output", "")
-        warning = result.get("warning", "")
-        lower_out = output.lower()
-        if "could not switch" in lower_out or "not found" in lower_out:
-            raise RuntimeError(f"Model switch failed: {output}")
-        return {"session_id": session_id, "model": model, "output": output,
-                "warning": warning or None, "status": "ok"}
 
     # ---- Kanban plugin HTTP API (mounted at /api/plugins/kanban/) ----------
 
@@ -1158,7 +1114,9 @@ class GuiBackend:
                                  provider_override: Optional[str] = None,
                                  reasoning_effort: Optional[str] = None,
                                  max_runtime_seconds: Optional[int] = None,
-                                 triage: bool = False, idempotency_key: Optional[str] = None,
+                                 triage: Optional[bool] = None,
+                                 hold: bool = False,
+                                 idempotency_key: Optional[str] = None,
                                  completion_contract: Optional[str] = None,
                                  acceptance_criteria: Optional[list] = None,
                                  board: Optional[str] = None) -> dict:
@@ -1169,6 +1127,20 @@ class GuiBackend:
         deterministic idempotency_key from title+body+assignee if absent
         to prevent duplicate cards on retries.
 
+        Safety rails (client-side only; the dispatcher and kanban.db are
+        unchanged):
+
+          * ``hold=True`` forces ``triage=True`` and clears ``assignee``
+            so the dispatcher cannot auto-claim the card. Use for drafts,
+            tests, or cards you will assign later.
+          * When ``triage`` is left unspecified (None), ``goal_mode=False``,
+            and the assignee is empty or ``default``, triage defaults to
+            True — the common "create a card I don't want running yet"
+            path must not auto-spawn a worker. Pass ``triage=False``
+            explicitly to override and allow auto-dispatch.
+          * When the create WILL auto-dispatch (known assignee, not
+            triage, not hold), the response includes a ``warning`` field.
+
         completion_contract: GitHub PR-acceptance gate. Accepted values:
           "local-only" (default), "OWNER/REPO", or an exact
           https://github.com/OWNER/REPO/pull/N URL. Absent from the
@@ -1177,6 +1149,21 @@ class GuiBackend:
           "## Required handoff evidence" section to the body.
         """
         import re as _re
+
+        # --- Client-side safety rails (see docstring) -----------------------
+        if hold:
+            # Explicit hold: land in triage, unassigned, so nothing can spawn.
+            triage = True
+            assignee = None
+        elif triage is None:
+            # Auto default: a non-goal card with no/weak assignee is almost
+            # always a draft, not a spawn request.
+            if not goal_mode and (not assignee or assignee.strip().lower() == "default"):
+                triage = True
+            else:
+                triage = False
+        else:
+            triage = bool(triage)
 
         # Validate completion_contract
         valid_contracts = ("local-only",)
@@ -1222,9 +1209,12 @@ class GuiBackend:
             raw = f"{title}|{effective_body or ''}|{assignee or ''}"
             idempotency_key = hashlib.sha256(raw.encode()).hexdigest()[:32]
 
+        # True when the dispatcher can pick this card up as soon as it lands.
+        will_auto_dispatch = bool(assignee) and not triage and not hold
+
         # When completion_contract is non-default, use the CLI path
         if not contract_is_default:
-            return await self._kanban_create_via_cli(
+            result = await self._kanban_create_via_cli(
                 title=title, body=effective_body, assignee=assignee,
                 priority=priority, parents=parents, skills=skills,
                 workspace_kind=workspace_kind, workspace_path=workspace_path,
@@ -1234,20 +1224,32 @@ class GuiBackend:
                 triage=triage, idempotency_key=idempotency_key,
                 completion_contract=completion_contract, board=board,
             )
+        else:
+            payload: dict = {
+                "title": title, "body": effective_body, "assignee": assignee,
+                "priority": priority, "parents": parents or [], "skills": skills,
+                "workspace_kind": workspace_kind, "workspace_path": workspace_path,
+                "goal_mode": goal_mode, "goal_max_turns": goal_max_turns,
+                "model_override": model_override, "provider_override": provider_override,
+                "reasoning_effort": reasoning_effort, "max_runtime_seconds": max_runtime_seconds,
+                "triage": triage, "idempotency_key": idempotency_key,
+            }
+            params_q = {"board": board} if board else {}
+            r = await self._kanban_request("POST", "/tasks", json=payload, params=params_q)
+            r.raise_for_status()
+            result = r.json()
 
-        payload: dict = {
-            "title": title, "body": effective_body, "assignee": assignee,
-            "priority": priority, "parents": parents or [], "skills": skills,
-            "workspace_kind": workspace_kind, "workspace_path": workspace_path,
-            "goal_mode": goal_mode, "goal_max_turns": goal_max_turns,
-            "model_override": model_override, "provider_override": provider_override,
-            "reasoning_effort": reasoning_effort, "max_runtime_seconds": max_runtime_seconds,
-            "triage": triage, "idempotency_key": idempotency_key,
-        }
-        params_q = {"board": board} if board else {}
-        r = await self._kanban_request("POST", "/tasks", json=payload, params=params_q)
-        r.raise_for_status()
-        return r.json()
+        if will_auto_dispatch and isinstance(result, dict) and "warning" not in result:
+            # Make the spawn side-effect visible to callers who only meant
+            # to create a card. hold=true is the opt-out.
+            result = {
+                **result,
+                "warning": (
+                    f"Card will be auto-dispatched to assignee {assignee!r}. "
+                    f"Pass hold=true to create without spawning a worker."
+                ),
+            }
+        return result
 
     async def _kanban_create_via_cli(self, **kwargs) -> dict:
         """Create a kanban task via the hermes CLI for completion_contract support.
@@ -1621,6 +1623,12 @@ class GuiBackend:
         For draft sessions, submits against the live id directly (same as
         send_prompt's draft path). Removes the draft record after first prompt.
 
+        A setup-phase TimeoutError (session.resume did not reply) yields
+        ``__done__`` with the same structured pending shape as the mid-turn
+        timeout — the caller should poll get_messages rather than treat it
+        as a hard MCP failure. The draft mapping is preserved because the
+        turn may not have started.
+
         Args:
             continuous_work: None (default) resolves from the in-process
                 CW registry. True/False force the flag. prompt.submit
@@ -1639,7 +1647,26 @@ class GuiBackend:
                     "jsonrpc": "2.0", "id": 1, "method": "session.resume",
                     "params": {"session_id": session_id},
                 }))
-                resp = await _recv_response(ws, 1, timeout=15)
+                try:
+                    resp = await _recv_response(ws, 1, timeout=15)
+                except TimeoutError:
+                    # Setup timed out before the turn started. Do NOT remove
+                    # the draft mapping — the session may still be usable.
+                    # Surface as pending, not an error, so a short client
+                    # timeout looks like "still running" rather than a hard
+                    # MCP failure.
+                    yield ("__done__", {
+                        "response": None,
+                        "session_id": session_id,
+                        "timed_out": True,
+                        "status": "pending",
+                        "note": (
+                            "Setup timed out waiting for session.resume. "
+                            "The session may be busy; the turn may not "
+                            "have started. Poll get_messages, then retry."
+                        ),
+                    })
+                    return
                 if "error" in resp:
                     error = resp["error"]
                     if error.get("code") == 4007:
@@ -1672,7 +1699,7 @@ class GuiBackend:
                     raw = await asyncio.wait_for(
                         ws.recv(), timeout=max(1.0, deadline - time.time()),
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 evt = json.loads(raw)
                 if evt.get("method") != "event":
@@ -1700,13 +1727,22 @@ class GuiBackend:
                 if etype == "error":
                     raise RuntimeError(f"agent error mid-turn: {payload}")
 
-            # Timed out — clean up draft record and return partial response
+            # Timed out waiting for the reply — the turn may still be
+            # running. Align with _poll_for_reply's pending shape so callers
+            # (and h_send_prompt) treat this as "poll later", not failure.
             if draft_record:
                 await self._draft_sessions.remove(session_id)
             yield ("__done__", {
                 "response": "".join(final_text_parts),
                 "session_id": session_id,
                 "timed_out": True,
+                "status": "pending",
+                "note": (
+                    "Timed out waiting for the agent reply; the turn may "
+                    "still be running. Poll get_messages for the final "
+                    "answer. send_prompt_stream is preferred when you need "
+                    "visibility into a long turn."
+                ),
             })
 
 
@@ -2361,7 +2397,11 @@ TOOLS: list[Tool] = [
             "agent is doing, use send_prompt_stream instead. "
             "Continuous work state is automatically preserved across sends "
             "(resolved from the in-process registry set by set_continuous_work)."
-            " Note: if a human has this session's GUI tab open, using this tool "
+            " On timeout the result is {timed_out: true, status: \"pending\"} "
+            "(not an error) — the turn may still be running; poll get_messages "
+            "for the reply. send_prompt_stream is preferred when you need "
+            "visibility into a long turn. "
+            "Note: if a human has this session's GUI tab open, using this tool "
             "will freeze that tab's live view until they reopen/refocus it (known "
             "backend limitation, not a bug in this server)."
         ),
@@ -2444,12 +2484,13 @@ TOOLS: list[Tool] = [
             "per session). A rejection lists near-miss candidates, so the "
             "error text tells you the correct spelling. The output field "
             "contains the backend's /model command output confirming the "
-            "switch."
+            "switch. On timeout the tool retries once automatically, then "
+            "returns a retryable model_switch_timeout error."
         ),
         inputSchema={"type": "object", "properties": {
             "session_id": {"type": "string", "description": "Session to change model on"},
             "model": {"type": "string", "description": "Model id as the provider lists it, e.g. 'deepseek/deepseek-v4-flash-0731'. Do not prefix the gateway ('openrouter/...' is rejected)."},
-            "timeout": {"type": "number", "description": "Max seconds to wait (default 15)"},
+            "timeout": {"type": "number", "description": "Max seconds to wait (default 30)"},
         }, "required": ["session_id", "model"]},
     ),
     Tool(
@@ -2542,7 +2583,19 @@ TOOLS: list[Tool] = [
             "known profile list (the dispatcher silently drops unknown "
             "assignees). Auto-generates a deterministic idempotency key from "
             "title+body+assignee to prevent duplicate cards on retries. "
-            "goal_mode defaults to TRUE. completion_contract is a GitHub "
+            "goal_mode defaults to TRUE. "
+            "SAFETY RAILS (client-side only): "
+            "(1) hold=true creates the card without dispatching a worker — "
+            "lands in triage, unassigned. Use for drafts, tests, or when you "
+            "will assign later. "
+            "(2) When goal_mode=false AND the assignee is empty or 'default' "
+            "AND triage is not specified, triage defaults to True so the "
+            "common 'create a card I don't want running yet' path cannot "
+            "auto-spawn a worker. Pass triage=false explicitly to let "
+            "'default' spawn. "
+            "(3) When the create WILL auto-dispatch (known assignee, not "
+            "triage, not hold), the response includes a warning field. "
+            "completion_contract is a GitHub "
             "PR-acceptance gate ('local-only', 'OWNER/REPO', or exact PR URL); "
             "when non-default, uses the hermes CLI. acceptance_criteria appends "
             "evidence requirements to the body."
@@ -2562,7 +2615,23 @@ TOOLS: list[Tool] = [
             "provider_override": {"type": "string", "description": "Provider for model_override"},
             "reasoning_effort": {"type": "string", "description": "none|minimal|…|ultra"},
             "max_runtime_seconds": {"type": "integer", "description": "Per-task runtime cap"},
-            "triage": {"type": "boolean", "description": "Land in triage instead of todo (default false)"},
+            "triage": {
+                "type": "boolean",
+                "description": (
+                    "Land in triage instead of ready/todo. When omitted and "
+                    "goal_mode=false with an empty/'default' assignee, "
+                    "defaults to true (safe: no auto-dispatch). Pass false "
+                    "explicitly to allow 'default' to spawn."
+                ),
+            },
+            "hold": {
+                "type": "boolean",
+                "description": (
+                    "Create the card without dispatching a worker (lands in "
+                    "triage, unassigned). Use for drafts, tests, or when you "
+                    "will assign later. Default false."
+                ),
+            },
             "idempotency_key": {"type": "string", "description": "Deterministic key to prevent duplicate cards on retries"},
             "completion_contract": {"type": "string", "description": "GitHub PR-acceptance gate: 'local-only' (default), 'OWNER/REPO', or 'https://github.com/OWNER/REPO/pull/N'. When non-default, uses the hermes CLI."},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Evidence requirements appended as '## Required handoff evidence' section to body"},
@@ -2964,6 +3033,21 @@ async def h_send_prompt(args: dict):
         return _text(json.dumps(result, indent=2, default=str))
     try:
         return await _retry_handler(_do)
+    except TimeoutError:
+        # Last-resort: send_prompt_stream already converts its own setup
+        # and poll timeouts into a structured pending payload. If a
+        # TimeoutError still escapes, report pending rather than
+        # internal_error — the turn may well be running.
+        return _text(json.dumps({
+            "response": None,
+            "session_id": args.get("session_id"),
+            "timed_out": True,
+            "status": "pending",
+            "note": (
+                "Timed out waiting for the session; the turn may still "
+                "be running. Poll get_messages for the reply."
+            ),
+        }, indent=2, default=str))
     except RuntimeError as e:
         msg = str(e)
         if "4007" in msg or "session not found" in msg.lower():
@@ -3047,18 +3131,36 @@ async def h_fork_chat(args: dict):
 
 
 async def h_set_model(args: dict):
+    timeout = float(args.get("timeout", 30) or 30)
+
     async def _do():
         b = await _require_backend()
         result = await b.set_model(
             args["session_id"],
             args["model"],
-            timeout=args.get("timeout", 15),
+            timeout=timeout,
         )
         return _text(json.dumps(result, indent=2, default=str))
     try:
         return await _retry_handler(_do)
     except RuntimeError as e:
         return _err("backend_error", str(e))
+    except TimeoutError:
+        # set_model already retried once with a doubled timeout before
+        # re-raising; a second timeout means the session is still busy.
+        # Surface as a structured retryable error so the caller knows to
+        # wait/retry rather than treating it as an opaque internal failure.
+        waited = max(timeout * 2.0, 30.0)
+        return _err(
+            "model_switch_timeout",
+            (
+                f"Timed out after {waited:.0f}s waiting for session.resume/"
+                f"/model. The session may be busy. Retry with a larger "
+                f"timeout, or interrupt the turn first via "
+                f"goal_action/run_slash."
+            ),
+            retryable=True,
+        )
 
 
 async def h_send_prompt_stream(args: dict):
@@ -3097,6 +3199,22 @@ async def h_send_prompt_stream(args: dict):
         }, indent=2, default=str))
     try:
         return await _retry_handler(_do)
+    except TimeoutError:
+        # Last-resort: send_prompt_stream yields structured pending on its
+        # own setup/poll timeouts. If one still escapes, keep the contract
+        # (pending, not internal_error) so callers can poll get_messages.
+        return _text(json.dumps({
+            "response": None,
+            "session_id": args.get("session_id"),
+            "timed_out": True,
+            "status": "pending",
+            "note": (
+                "Timed out waiting for the session; the turn may still "
+                "be running. Poll get_messages for the reply."
+            ),
+            "event_count": 0,
+            "events": [],
+        }, indent=2, default=str))
     except RuntimeError as e:
         msg = str(e)
         if "4007" in msg or "session not found" in msg.lower():
@@ -3275,6 +3393,9 @@ async def h_kanban_show(args: dict):
 async def h_kanban_create(args: dict):
     async def _do():
         b = await _require_backend()
+        # triage is Optional here: None means "let the backend method pick
+        # the safe default" (see kanban_create_task's safety rails). An
+        # explicit true/false from the caller is forwarded as-is.
         data = await b.kanban_create_task(
             title=args["title"], body=args.get("body"),
             assignee=args.get("assignee"), priority=args.get("priority", 0),
@@ -3287,7 +3408,8 @@ async def h_kanban_create(args: dict):
             provider_override=args.get("provider_override"),
             reasoning_effort=args.get("reasoning_effort"),
             max_runtime_seconds=args.get("max_runtime_seconds"),
-            triage=args.get("triage", False),
+            triage=args.get("triage"),
+            hold=bool(args.get("hold", False)),
             idempotency_key=args.get("idempotency_key"),
             completion_contract=args.get("completion_contract"),
             acceptance_criteria=args.get("acceptance_criteria"),
@@ -3505,12 +3627,21 @@ def _exc_detail(e: BaseException) -> str:
     "Internal error in list_chats: " with nothing after the colon. A report
     that names no cause is indistinguishable from a truncated one, so fall
     back to the type name (and, for an HTTP error, the status) instead.
+    TimeoutError additionally gets a short actionable hint so the caller
+    knows the fix is "wait longer", not "this is broken".
     """
     detail = str(e).strip()
     if detail:
         return detail
     if isinstance(e, httpx.HTTPStatusError):
         return f"{type(e).__name__} (HTTP {e.response.status_code}, empty body)"
+    # On Python 3.11+ asyncio.TimeoutError is an alias of TimeoutError; a
+    # single isinstance covers both spellings.
+    if isinstance(e, TimeoutError):
+        return (
+            f"{type(e).__name__} (no message) — operation exceeded its "
+            f"timeout; retry with a larger 'timeout' argument"
+        )
     return f"{type(e).__name__} (no message)"
 
 

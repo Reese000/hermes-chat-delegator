@@ -2278,7 +2278,24 @@ class TestExcDetail:
     """
 
     def test_empty_exception_str_falls_back_to_type_name(self):
-        assert server._exc_detail(TimeoutError()) == "TimeoutError (no message)"
+        # TimeoutError also gets an actionable hint (defect 5): the bare
+        # fallback alone ("TimeoutError (no message)") told the caller
+        # nothing about what to do next.
+        detail = server._exc_detail(TimeoutError())
+        assert detail.startswith("TimeoutError (no message)")
+        assert "timeout" in detail.lower()
+        assert "retry" in detail.lower()
+
+    def test_timeout_hint_is_actionable(self):
+        """A bare TimeoutError must name the fix (larger timeout), not just
+        the type — this was the live 'TimeoutError (no message)' complaint."""
+        detail = server._exc_detail(asyncio.TimeoutError())
+        assert "retry with a larger 'timeout' argument" in detail
+
+    def test_non_timeout_bare_exception_keeps_plain_fallback(self):
+        """The hint is TimeoutError-specific; other bare exceptions keep
+        the plain type-name fallback so we do not invent stack traces."""
+        assert server._exc_detail(RuntimeError()) == "RuntimeError (no message)"
 
     def test_whitespace_only_message_is_treated_as_empty(self):
         assert server._exc_detail(RuntimeError("   ")) == "RuntimeError (no message)"
@@ -2309,3 +2326,265 @@ class TestSetModelDocumentsCorrectFormat:
         blob = tool.description + json.dumps(tool.inputSchema)
         assert "openrouter/anthropic" not in blob
         assert "openrouter/..." in blob or "Do not prefix" in blob or "do NOT prefix" in blob
+
+    def test_default_timeout_is_30(self):
+        """Defect 2: 15s was too tight for resume + slash.exec on a session
+        that just had a turn interrupted."""
+        tool = next(t for t in server.TOOLS if t.name == "set_model")
+        assert "default 30" in tool.inputSchema["properties"]["timeout"]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: dead duplicate methods must be gone
+# ---------------------------------------------------------------------------
+
+class TestNoDuplicateGuiBackendMethods:
+    """Python keeps only the last definition, so a second set_model /
+    _interrupt_and_switch silently shadows the first — someone edits the
+    dead one and nothing changes. Each name must appear exactly once."""
+
+    def _method_def_lines(self, name: str) -> list[int]:
+        import inspect
+        src = inspect.getsource(GuiBackend)
+        needle = f"async def {name}("
+        return [
+            i for i, line in enumerate(src.splitlines(), 1)
+            if line.lstrip().startswith(needle)
+        ]
+
+    def test_set_model_defined_once(self):
+        lines = self._method_def_lines("set_model")
+        assert len(lines) == 1, f"set_model defined {len(lines)} times at {lines}"
+
+    def test_interrupt_and_switch_defined_once(self):
+        lines = self._method_def_lines("_interrupt_and_switch")
+        assert len(lines) == 1, (
+            f"_interrupt_and_switch defined {len(lines)} times at {lines}"
+        )
+
+    def test_set_model_helper_not_shadowed(self):
+        """_set_model_once is the retry unit; it must also be unique."""
+        lines = self._method_def_lines("_set_model_once")
+        assert len(lines) == 1
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: set_model timeout → structured retryable + auto-retry
+# ---------------------------------------------------------------------------
+
+def _make_ws_backend():
+    transport = MockTransport({
+        "/health": (200, {"status": "ok"}),
+        "/api/sessions": (200, {"sessions": []}),
+    })
+    backend = GuiBackend("127.0.0.1", 9999)
+    backend._client = httpx.AsyncClient(transport=transport, timeout=5)
+    return backend
+
+
+class NeverRepliesWebSocket:
+    """WS whose recv() raises TimeoutError immediately (frames exhausted).
+
+    Simulates a session that never answers resume/slash.exec without making
+    the test wait for a real wall-clock timeout.
+    """
+
+    def __init__(self, frames=None):
+        self._frames = iter(frames or [])
+        self._sent: list[str] = []
+
+    async def send(self, data):
+        self._sent.append(data)
+
+    async def recv(self):
+        try:
+            return json.dumps(next(self._frames))
+        except StopIteration:
+            raise asyncio.TimeoutError()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+@pytest.mark.asyncio
+class TestSetModelTimeout:
+    """Defect 2: a TimeoutError must become a structured retryable error,
+    and set_model must auto-retry once with a doubled timeout."""
+
+    async def test_double_timeout_raises_timeout_error(self):
+        """Both attempts time out → asyncio.TimeoutError propagates so
+        h_set_model can map it to model_switch_timeout."""
+        backend = _make_ws_backend()
+        connect_count = {"n": 0}
+
+        def make_ws(url, **kwargs):
+            connect_count["n"] += 1
+            return NeverRepliesWebSocket()
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = make_ws
+            with pytest.raises(TimeoutError):
+                await backend.set_model("durable_123", "some/model", timeout=0.01)
+
+        # First attempt + one retry = two WS connections
+        assert connect_count["n"] == 2
+
+    async def test_auto_retry_succeeds_on_second_attempt(self):
+        """First attempt times out; the doubled-timeout retry succeeds."""
+        backend = _make_ws_backend()
+        connect_count = {"n": 0}
+        success_frames = [
+            {"id": 1, "result": {"session_id": "live_ok"}},
+            {"id": 2, "result": {"output": "Switched to some/model"}},
+        ]
+
+        def make_ws(url, **kwargs):
+            connect_count["n"] += 1
+            if connect_count["n"] == 1:
+                return NeverRepliesWebSocket()  # first attempt times out
+            return FakeWebSocketSendPrompt(success_frames)
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = make_ws
+            result = await backend.set_model("durable_123", "some/model", timeout=0.01)
+
+        assert result["status"] == "ok"
+        assert result["model"] == "some/model"
+        assert connect_count["n"] == 2
+
+    async def test_h_set_model_maps_timeout_to_structured_error(self):
+        """Handler-level contract: TimeoutError is NOT internal_error."""
+        import hermes_chat_delegator.server as mod
+
+        backend = _make_ws_backend()
+
+        def make_ws(url, **kwargs):
+            return NeverRepliesWebSocket()
+
+        with patch.object(mod, "_require_backend", new_callable=AsyncMock) as mock_rb:
+            mock_rb.return_value = backend
+            with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+                mock_ws.connect = make_ws
+                result = await mod.h_set_model({
+                    "session_id": "durable_123",
+                    "model": "some/model",
+                    "timeout": 0.01,
+                })
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] == "model_switch_timeout"
+        assert data["error"]["retryable"] is True
+        # Message must be actionable, not "TimeoutError (no message)"
+        msg = data["error"]["message"]
+        assert "session.resume" in msg or "/model" in msg
+        assert "larger" in msg.lower() or "retry" in msg.lower()
+
+    async def test_h_set_model_does_not_return_internal_error_on_timeout(self):
+        """Regression: the old path produced
+        {"error":{"code":"internal_error","message":"Internal error in
+        set_model: TimeoutError (no message)","retryable":false}}."""
+        import hermes_chat_delegator.server as mod
+
+        class AlwaysTimesOut:
+            async def set_model(self, session_id, model, timeout=30):
+                raise asyncio.TimeoutError()
+
+        with patch.object(mod, "_require_backend", new_callable=AsyncMock) as mock_rb:
+            mock_rb.return_value = AlwaysTimesOut()
+            result = await mod.h_set_model({
+                "session_id": "s", "model": "m", "timeout": 5,
+            })
+
+        data = json.loads(result[0].text)
+        assert data["error"]["code"] != "internal_error"
+        assert data["error"]["code"] == "model_switch_timeout"
+        assert data["error"]["retryable"] is True
+
+
+@pytest.mark.asyncio
+class TestSendPromptStreamSetupTimeout:
+    """Defect 3: a resume timeout during setup must yield structured
+    pending (__done__), not raise into internal_error."""
+
+    async def test_resume_timeout_yields_structured_pending(self):
+        backend = _make_ws_backend()
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: NeverRepliesWebSocket()
+            events = []
+            final = None
+            async for etype, payload in backend.send_prompt_stream(
+                "s", "hi", timeout=5
+            ):
+                if etype == "__done__":
+                    final = payload
+                    break
+                events.append(etype)
+
+        assert final is not None, "setup timeout must yield __done__, not raise"
+        assert final["timed_out"] is True
+        assert final["status"] == "pending"
+        assert final["response"] is None
+        assert final["session_id"] == "s"
+        assert "get_messages" in final.get("note", "")
+        # Setup timeout means the turn may not have started — no mid-turn
+        # events should have been emitted.
+        assert events == []
+
+    async def test_setup_timeout_does_not_remove_draft(self):
+        """A setup-timeout happens BEFORE prompt.submit, so the turn may
+        not have started. Deleting the draft mapping would strand the
+        caller — the resume path must not call _draft_sessions.remove."""
+        backend = _make_ws_backend()
+        remove_calls = []
+        backend._draft_sessions.remove = AsyncMock(
+            side_effect=lambda sid: remove_calls.append(sid)
+        )
+
+        with patch("hermes_chat_delegator.server.websockets") as mock_ws:
+            mock_ws.connect = lambda url, **kw: NeverRepliesWebSocket()
+            final = None
+            async for etype, payload in backend.send_prompt_stream(
+                "durable_x", "hi", timeout=5
+            ):
+                if etype == "__done__":
+                    final = payload
+                    break
+
+        assert final is not None
+        assert final["status"] == "pending"
+        assert remove_calls == [], (
+            "setup-timeout must not delete the draft mapping — the turn "
+            "may not have started"
+        )
+
+    async def test_h_send_prompt_never_lets_timeout_escape_as_internal_error(self):
+        """Even if the backend method raises TimeoutError directly, the
+        handler must convert it to structured pending."""
+        import hermes_chat_delegator.server as mod
+
+        class AlwaysTimesOut:
+            async def send_prompt(self, sid, msg, timeout=300):
+                raise asyncio.TimeoutError()
+
+        with patch.object(mod, "_require_backend_for_session",
+                          new_callable=AsyncMock) as mock_rb:
+            mock_rb.return_value = AlwaysTimesOut()
+            result = await mod.h_send_prompt({
+                "session_id": "s", "message": "hi", "timeout": 5,
+            })
+
+        data = json.loads(result[0].text)
+        assert "error" not in data
+        assert data["timed_out"] is True
+        assert data["status"] == "pending"
+
+    async def test_send_prompt_tool_documents_timeout_as_pending(self):
+        tool = next(t for t in server.TOOLS if t.name == "send_prompt")
+        blob = tool.description
+        assert "timed_out" in blob
+        assert "pending" in blob
+        assert "send_prompt_stream" in blob
