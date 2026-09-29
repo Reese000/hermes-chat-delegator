@@ -133,6 +133,67 @@ class TestKanbanBoard:
         result = await backend.kanban_get_board(compact=False)
         assert result["columns"][0]["tasks"][0]["id"] == "t_1"
 
+    # 2026-09-29: status/assignee were accepted and silently dropped, so
+    # status="running" returned the whole 309-task board (74k characters).
+    _MIXED_BOARD = {"columns": [
+        {"name": "running", "tasks": [
+            {"id": "t_r1", "title": "R", "status": "running", "assignee": "default", "priority": 1},
+            {"id": "t_r2", "title": "R2", "status": "running", "assignee": "agent-x", "priority": 1},
+        ]},
+        {"name": "ready", "tasks": [
+            {"id": "t_q1", "title": "Q", "status": "ready", "assignee": "default", "priority": 1},
+        ]},
+        {"name": "done", "tasks": [
+            {"id": f"t_d{i}", "title": "D", "status": "done", "assignee": "default", "priority": 0}
+            for i in range(50)
+        ]},
+    ], "assignees": ["default", "agent-x"]}
+
+    async def test_status_filter_is_applied(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board(status="running")
+        ids = [t["id"] for c in result["columns"] for t in c["tasks"]]
+        assert ids == ["t_r1", "t_r2"]
+        assert result["total"] == 2
+        assert "summarised_columns" not in result
+
+    async def test_status_filter_is_case_insensitive(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board(status="Running")
+        assert result["total"] == 2
+
+    async def test_assignee_filter_is_applied(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board(status="running", assignee="agent-x")
+        ids = [t["id"] for c in result["columns"] for t in c["tasks"]]
+        assert ids == ["t_r2"]
+
+    async def test_unfiltered_compact_counts_done_instead_of_listing(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board()
+        listed = {c["name"] for c in result["columns"]}
+        assert listed == {"running", "ready"}
+        assert result["summarised_columns"] == {"done": 50}
+        assert result["total"] == 53
+
+    async def test_done_listed_when_explicitly_requested(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board(status="done")
+        assert result["total"] == 50
+        assert len(result["columns"][0]["tasks"]) == 50
+
+    async def test_full_payload_honours_filters(self):
+        backend, _ = _make_kanban_backend({"/board": (200, self._MIXED_BOARD)})
+        result = await backend.kanban_get_board(status="ready", compact=False)
+        kept = [t["id"] for c in result["columns"] for t in c["tasks"]]
+        assert kept == ["t_q1"]
+
+    async def test_status_falls_back_to_column_name(self):
+        board = {"columns": [{"name": "running", "tasks": [{"id": "t_x"}]}], "assignees": []}
+        backend, _ = _make_kanban_backend({"/board": (200, board)})
+        result = await backend.kanban_get_board(status="running")
+        assert result["total"] == 1
+
 
 @pytest.mark.asyncio
 class TestKanbanShow:

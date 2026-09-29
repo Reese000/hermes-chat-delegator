@@ -39,6 +39,10 @@ from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
 
+# Kanban columns that only ever grow; compact board summaries count them
+# instead of listing them unless a status filter asks for one explicitly.
+_TERMINAL_COLUMNS = frozenset({"done", "archived"})
+
 # Hermes' GET /api/sessions rejects limit>100 with a bodyless HTTP 422.
 # Verified 2026-09-04 against a live backend by bisecting the query string:
 # limit<=100 -> 200, limit>=101 -> 422, while min_messages/order are always
@@ -1069,30 +1073,75 @@ class GuiBackend:
 
     async def kanban_get_board(self, *, status: Optional[str] = None, assignee: Optional[str] = None,
                                board: Optional[str] = None, compact: bool = True) -> dict:
-        """GET /board — compact column summary (default) or full payload."""
+        """GET /board — compact column summary (default) or full payload.
+
+        ``status`` and ``assignee`` are applied client-side (the backend's
+        /board endpoint ignores them), in both compact and full mode: a task
+        is kept when its ``status`` — or, if absent, its column name — equals
+        ``status`` (case-insensitive), and its ``assignee`` equals
+        ``assignee``.  Previously both parameters were accepted and silently
+        dropped, so ``status="running"`` returned the whole board (309 tasks,
+        74k characters, 2026-09-29).
+
+        In compact mode with no ``status`` filter, terminal columns
+        (``_TERMINAL_COLUMNS``) are summarised as a count only; they grow
+        without bound and are almost never what a board query is after.
+        Ask for them explicitly (``status="done"``) to list them.
+        """
         params: dict = {}
         if board:
             params["board"] = board
         r = await self._kanban_request("GET", "/board", params=params)
         r.raise_for_status()
         data = r.json()
+
+        want_status = status.strip().lower() if isinstance(status, str) and status.strip() else None
+        want_assignee = assignee.strip() if isinstance(assignee, str) and assignee.strip() else None
+
+        def _keep(task: dict, col_name: str) -> bool:
+            task_status = str(task.get("status") or col_name or "").lower()
+            if want_status is not None and task_status != want_status:
+                return False
+            if want_assignee is not None and task.get("assignee") != want_assignee:
+                return False
+            return True
+
+        columns = data.get("columns", []) or []
+
         if not compact:
-            return data
-        columns = data.get("columns", [])
-        result = {"columns": [], "assignees": data.get("assignees", [])}
+            if want_status is None and want_assignee is None:
+                return data
+            filtered = dict(data)
+            filtered["columns"] = [
+                {**col, "tasks": [t for t in col.get("tasks", []) or []
+                                  if _keep(t, col.get("name", ""))]}
+                for col in columns
+            ]
+            return filtered
+
+        result: dict = {"columns": [], "assignees": data.get("assignees", [])}
+        summarised: dict = {}
         for col in columns:
-            tasks_out = []
-            for t in col.get("tasks", []):
-                tasks_out.append({
-                    "id": t.get("id"),
-                    "title": t.get("title", "")[:80],
-                    "status": t.get("status"),
-                    "assignee": t.get("assignee"),
-                    "priority": t.get("priority", 0),
-                })
-            if tasks_out:
-                result["columns"].append({"name": col["name"], "tasks": tasks_out, "count": len(tasks_out)})
-        result["total"] = sum(c["count"] for c in result["columns"])
+            col_name = col.get("name", "")
+            kept = [t for t in col.get("tasks", []) or [] if _keep(t, col_name)]
+            if not kept:
+                continue
+            if want_status is None and str(col_name).lower() in _TERMINAL_COLUMNS:
+                summarised[col_name] = len(kept)
+                continue
+            tasks_out = [{
+                "id": t.get("id"),
+                "title": (t.get("title") or "")[:80],
+                "status": t.get("status"),
+                "assignee": t.get("assignee"),
+                "priority": t.get("priority", 0),
+            } for t in kept]
+            result["columns"].append({"name": col_name, "tasks": tasks_out, "count": len(tasks_out)})
+        if summarised:
+            result["summarised_columns"] = summarised
+            result["note"] = ("Terminal columns shown as counts only; pass "
+                              "status='<column>' to list them.")
+        result["total"] = sum(c["count"] for c in result["columns"]) + sum(summarised.values())
         return result
 
     async def kanban_show_task(self, task_id: str, *, board: Optional[str] = None) -> dict:
@@ -2561,7 +2610,7 @@ TOOLS: list[Tool] = [
             "status": {"type": "string", "description": "Filter to one column (e.g. 'ready', 'running')"},
             "assignee": {"type": "string", "description": "Filter tasks by assignee"},
             "board": {"type": "string", "description": "Board slug (omit for current)"},
-            "compact": {"type": "boolean", "description": "Full payload (default false = compact)"},
+            "compact": {"type": "boolean", "description": "Default true = compact rows (done/archived shown as counts unless status asks for them); false = full payload, still filtered by status/assignee"},
         }},
     ),
     Tool(
